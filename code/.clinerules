@@ -1,0 +1,106 @@
+# user118 环境规则
+
+## 基本信息
+- 当前用户：liyite
+- 机器编号：user118（122 服务器）
+- 工作目录：/home/user118/
+- Python 环境：conda activate facfmk
+- 主要依赖：polars, lightgbm, duckdb, pyarrow, torch
+
+## 服务器硬件配置
+- CPU：AMD EPYC 7763 64-Core Processor × 4（共 256 线程）
+- 内存：4 TiB 总内存，通常有 1~2 TiB 空闲可用
+- GPU：8 × NVIDIA GeForce RTX 3090（每卡 24GB 显存，共 192GB）
+- 磁盘：共享存储，数据量大时注意 I/O 瓶颈
+
+## 项目导航
+各项目根目录下有 project_doc.md 记录项目进展和上下文：
+- **每次新会话开始某个项目的工作时，请先读取该项目的 project_doc.md 获取上下文**
+
+当前项目列表：
+| 项目 | 路径 | 说明 |
+|------|------|------|
+| strategy_highvol | /home/user118/strategy_highvol/ | 高波趋势股日内信号策略（核心项目） |
+| Lob | /home/user118/Lob/ | LOB 盘口因子计算 |
+| Concept | /home/user118/Concept/ | 同花顺概念因子计算 |
+| Text | /home/user118/Text/ | 文本情绪因子计算 |
+| Trans_Order | /home/user118/Trans_Order/ | 逐笔成交/委托因子计算 |
+| Tickbytick_Cancel | /home/user118/Tickbytick_Cancel/ | 逐笔撤单因子计算 |
+
+策略设计文档（早期思路参考，已弃用但有参考价值）：
+- /home/user118/strategy/高波趋势股日内信号策略_v1.md
+
+## 常用数据路径（122 服务器）
+
+### 框架路径
+```
+global_root    = /home/lwyxyz
+data79_root    = /home/lwyxyz/2.79
+minute_fea     = /home/lwyxyz/Stock60sBaseDataAll/Feather
+minute_mmap    = /home/lwyxyz/Stock60sBaseDataAll/Mmap
+support_config = /home/lwyxyz/Stock60sConfig/support_data
+```
+
+### 日频原始数据
+```
+OHLCV         = /home/lwyxyz/2.79/tonglian_data/ohlc_fea/
+support_data  = /home/lwyxyz/2.79/tonglian_data/support_data/
+短周期依赖     = /home/lwyxyz/2.79/update/短周期依赖数据/
+```
+
+### 高频数据
+```
+逐笔成交(trans_fea)     = /home/lwyxyz/2.79/ftp/mdl_fea/trans_fea/{YYYYMMDD}_trans.fea
+逐笔委托(order_fea)     = /home/lwyxyz/2.79/ftp/mdl_fea/order_fea/
+逐笔成交合并(SZ)        = /home/lwyxyz/2.79/ftp/mdl_fea/order_trans_sz/{YYYYMMDD}.fea
+逐笔成交合并(SH)        = /home/lwyxyz/2.79/ftp/mdl_fea/order_trans_sh/{YYYYMMDD}.fea
+分钟K线                  = /home/lwyxyz/2.79/tonglian_data/min_data/
+```
+
+### LOB 盘口数据（122 服务器专用路径）
+```
+sec_lobdata       = /home/lwyxyz/hft_database/nas3/sec_lobdata/
+lobdata_all       = /home/lwyxyz/hft_database/nas3/lobdata_all/
+tickbytick_lob_SZ = /home/lwyxyz/253.118/lob_data/lob_data_sz/{YYYYMMDD}.parquet
+tickbytick_lob_SH = /home/lwyxyz/253.118/lob_data/lob_data_sh/{YYYYMMDD}.parquet
+```
+
+### 文本数据
+```
+dfcf_all     = /home/text_data/dfcf/dfcf_aligned/dfcf_all/dfcf_all_{YYYYMMDD}.fea
+dfcf_pre     = /home/text_data/dfcf/dfcf_aligned/dfcf_pre/
+dfcf_intra   = /home/text_data/dfcf/dfcf_aligned/dfcf_intra/
+dfcf_overnight = /home/text_data/dfcf/dfcf_aligned/dfcf_overnight/
+概念板块      = /home/lwyxyz/2.79/ths_concept_history/{YYYYMMDD}.fea
+```
+
+### 自研数据
+```
+VWAP(10:00~14:00) = /home/user118/vwap/vwap_1000_1400.parquet
+```
+
+## 数据使用注意事项
+- 委托数据 **20230821 为分界点**（前后文件名不同）：
+  - ≤20230821: `{date}_order.fea`(SZ) / `{date}_order_sh2.fea`(SH)
+  - >20230821: `{date}_order_sz.fea`(SZ) / `{date}_order_sh2.fea`(SH)
+- LOB 路径 119 vs 122 服务器不同，本机为 122
+- 文本数据在 119 服务器不可用
+- 数据时间过滤范围：09:25:00 ~ 14:57:00
+- 加密文件（.DATA 目录下）需用 Python 读取，不能用 cat/read_file
+- 详细数据路径说明见：/home/user118/数据路径汇总.md
+
+## 研究约束（所有任务必须遵守）
+- 因子计算使用 T-1 日及之前的数据（T-1 整日数据不算未来数据）
+- 交易逻辑：T-1 选池/计算因子 → T 日买入 → T+1 VWAP 卖出
+- 日内 tick 级信号因子需严格因果（backward-looking，无未来数据）
+- AI 生成的代码需人工审查后再运行
+- 特别警惕：文件删除、系统配置修改、网络请求等操作
+
+## 代码执行规则
+- **不要在后台运行长时间脚本**：用户会自行在终端中运行代码
+- 每次只需告诉用户需要运行什么命令，以及运行后需要反馈什么结果（如日志末尾、输出文件等）
+- 可以创建/修改脚本文件，但执行由用户完成
+
+## 特殊说明
+- 本机有加密系统，加密文件需用 Python 读取
+- 策略项目与公司标准 label1/label2 截面打分任务是完全不同的体系

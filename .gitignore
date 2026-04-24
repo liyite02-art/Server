@@ -1,0 +1,66 @@
+# ========== 平台/缓存 ==========
+.autodl/
+
+# ========== 数据与产物（不提交；与 Strategy/config.py 路径一致）==========
+min_data/
+Daily_data/
+Strategy/outputs/
+# 大体积原始数据/附件目录（按实际仓库结构调整，不需要进 Git 的在此列出）
+source/
+
+# 本地大表、中间结果（若存在）
+v1/
+*.mmap
+*.h5
+*.hdf5
+
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# ========== 环境与密钥（切勿提交）==========
+.env
+.env.*
+!.env.example
+*USERPROFILE*/
+**/*USERPROFILE*
+.ssh/
+*.pem
+id_ed25519*
+id_rsa*
+*.key
+*id_ed25519*
+
+# 子目录里另有 .git 时，避免误把整个目录当子模块加进来（要纳入代码可删掉下一行，或改用语义化 submodule）
+factorrepositoryrelease/
+lihang-code/
+
+# ========== Notebook ==========
+.ipynb_checkpoints/
+
+# ========== 编辑器与系统 ==========
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+*~
+
+# ========== 大文件/原始行情（根目录下按需保留小样本时可注释掉）==========
+# *.fea
+# *.pkl

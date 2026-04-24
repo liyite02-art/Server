@@ -1,0 +1,757 @@
+import gc
+from abc import abstractmethod
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import tabulate
+from typing import Iterable, Callable, Union
+
+from factor_repository.utility.constant import *
+from factor_repository.utility import get_data_from_local_rq_data, get_data_from_ctp_data
+from factor_repository.statistical_test.utility import *
+from factor_repository.utility.tools import *
+from sympy import factor
+
+
+class FactorRepositoryTemplate:
+    """
+    Store the factor data and provide the interface to access the factor data.
+    """
+
+    symbol: str = 'unfilled'
+
+    init_factor: list[str] = [
+        'vol_slice_imbalance',
+        'trade_price_imbalance',
+        'price_dist',
+        'active_buy_vol',
+        'active_sell_vol',
+        'active_buy_sell_imbalance',
+        'trade_price_vol_imbalance',
+        'price_diff_40',
+        'price_diff_10',
+        # 'order_submit_ask',
+        # 'order_submit_bid',
+        # 'order_submit_imbalance',
+        'vol_continue_increase_imbalance',
+        'vol_time_series_imbalance',
+        'vol_rank_imbalance',
+        'exp_vol_continue_increase_imbalance',
+        'order_flow_imbalance',
+        'vol_diff',
+        'vol_time_series_min_imbalance',
+        'vol_max_diff_imbalance',
+        'vol_order_imbalance',
+        # 'vol_slice_imbalance_div_std',
+        'effective_spread',
+        'spread']
+
+    def __init__(
+        self,
+        name: str,
+        # symbol: str,
+        # price_tick: [float, int],
+        # c_mult: [float, int],
+        start_date: Union[str, int],
+        end_date: Union[str, int],
+        src_root: str = LOCAL_RQ_ROOT,
+        src_type: str = 'local_rq'
+    ):
+        """
+        Initialize the factor repository.
+        :param name:
+        :param symbol:
+        :param price_tick:
+        :param c_mult:
+        :param start_date:
+        :param end_date:
+        :param src_root:
+        """
+        self.name: str                  = name
+        # self.symbol: str                = symbol
+        # self.price_tick: [float, int]   = price_tick
+        # self.c_mult: [float, int]       = c_mult
+        self.start_date: Union[str, int]     = start_date
+        self.end_date: Union[str, int]       = end_date
+        self.factors: list              = []
+
+        self.src_root: str = src_root
+        self._load_tick_data(src_root=src_root, src_type=src_type)
+
+    def _load_tick_data(self, src_root, src_type: str='local_rq') -> None:
+        """
+        Load the tick data.
+        """
+
+        night_start = SYMBOL_INFO[self.symbol]['trade_night_start']
+        night_end = SYMBOL_INFO[self.symbol]['trade_night_end']
+        day_start = SYMBOL_INFO[self.symbol]['trade_day_start']
+        day_end = SYMBOL_INFO[self.symbol]['trade_day_end']
+
+        if src_type == 'local_rq':
+            tick_data = get_data_from_local_rq_data(src_root, self.symbol, self.start_date, self.end_date)
+        elif src_type == 'ctp':
+            tick_data = get_data_from_ctp_data(src_root, self.symbol, self.start_date, self.end_date)
+        else:
+            raise ValueError('The source type is not supported.')
+
+        self.tick_data = dict()
+        for date, data in tick_data.items():
+            if np.sum(data[AV[0]]==0) == 0 and np.sum(data[BV[0]]==0) == 0:
+                if night_start is not None and night_end is not None:
+                    if night_start > night_end:
+                        night_df = data[(data[UPDATE_TIME] >= night_start) | (data[UPDATE_TIME] <= night_end)].copy()
+                    else:
+                        night_df = data[(data[UPDATE_TIME] >= night_start) & (data[UPDATE_TIME] <= night_end)].copy()
+                else:
+                    night_df = pd.DataFrame(columns=data.columns)
+                day_df = data[(data[UPDATE_TIME] >= day_start) & (data[UPDATE_TIME] <= day_end)].copy()
+                self.tick_data.update({date: (night_df, day_df)})
+
+        self._preprocess(self.tick_data)
+        self._concat()
+
+    def get_tick_data(self, date: str, sep: str=''):
+        """
+        Get the tick data of the specific date.
+        :param date:
+        :param sep:
+        :return:
+        """
+        if not isinstance(self.tick_data, dict):
+            raise ValueError('The tick data is not dict.')
+
+        if sep != '':
+            date = ''.join(date.split(sep))
+
+        if date not in self.tick_data:
+            raise ValueError(f'The date {date} is not in the tick data.')
+
+        return self.tick_data[date]
+
+    def get_concat_tick_data(self):
+        """
+        Get the concatenated tick data.
+        :return:
+        """
+        return self.concat_tick_data
+
+    def calc_init_factors(self):
+        """
+        Calculate the initial factors.
+        """
+        self.calc_factor(self.init_factor)
+
+    def calc_factor(self, factors: Iterable[str]) -> None:
+        """
+        Calculate the factor data.
+        """
+        self.external_calc_factor(factors, self.tick_data)
+        self._concat()
+        for f in factors:
+            if f not in self.factors:
+                self.factors.append(f)
+
+    def external_calc_factor(self, factors: Iterable[str], tick_data) -> None:
+        """
+        Calculate the external data factor.
+        """
+        for factor in factors:
+            factor_calculator = getattr(self, factor, None)
+
+            if factor_calculator is None:
+                raise ValueError(f'The factor {factor} of repository {self.name} is not supported.')
+
+            if isinstance(tick_data, dict):
+                for date, (night_df, day_df) in tick_data.items():
+                    process_df = [day_df]
+                    if not night_df.empty:
+                        process_df.append(night_df)
+                    else:
+                        night_df[factor] = 0
+                    for df in process_df:
+                        factor_calculator(df)
+            elif isinstance(tick_data, pd.DataFrame):
+                factor_calculator(tick_data)
+            else:
+                raise ValueError('The tick data type is not supported.')
+
+    def factor_install(self, func: [Callable, list[Callable]], name: [str, list]=None, **kwargs) -> None:
+        """
+        Install the factor function.
+        :param func:
+        :param name:
+        :return:
+        """
+
+        if name is None:
+            if isinstance(func, list):
+                name = [f.__name__ for f in func]
+            else:
+                name = func.__name__
+
+        if isinstance(self.tick_data, dict):
+            for night_df, day_df in self.tick_data.values():
+                process_df = [day_df]
+                if not night_df.empty:
+                    process_df.append(night_df)
+                else:
+                    night_df[name] = 0
+
+                if isinstance(func, list):
+                    for f in func:
+                        for df in process_df:
+                            f(df, **kwargs)
+                else:
+                    for df in process_df:
+                        func(df, **kwargs)
+
+        elif isinstance(self.tick_data, pd.DataFrame):
+            if isinstance(func, list):
+                for f in func:
+                    f(self.tick_data, **kwargs)
+            else:
+                func(self.tick_data, **kwargs)
+        else:
+            raise ValueError('The tick data type is not supported for factor install.')
+
+        self._concat()
+        if isinstance(name, list):
+            for n in name:
+                if n not in self.factors:
+                    self.factors.append(n)
+        else:
+            if name not in self.factors:
+                self.factors.append(name)
+
+    def _single_preprocess(self, tick_data: pd.DataFrame) -> None:
+        """
+        Preprocess the single day tick data.
+        :param tick_data:
+        :return:
+        """
+
+        c_mult = SYMBOL_INFO[self.symbol]['c_mult']
+
+        tick_data[VOL] = tick_data[VOL].diff().fillna(0)
+        tick_data[TURNOVER] = tick_data[TURNOVER].diff().fillna(0) / c_mult
+        tick_data[OPEN_INTEREST] = tick_data[OPEN_INTEREST].diff().fillna(0)
+        tick_data['mid_price'] = (tick_data[BP[0]] + tick_data[AP[0]]) / 2
+        tick_data['ave_price'] = ((tick_data[VOL] > 0) * (tick_data[TURNOVER] / tick_data[VOL])).fillna(0)
+        tick_data['log_mid_price'] = np.log(tick_data['mid_price'])
+        for w in [20, 40, 60, 80, 100, 120]:
+            tick_data[f'frt_{w}'] = tick_data['mid_price'].diff(w).shift(-w).fillna(0)
+            tick_data[f'log_frt_{w}'] = tick_data['log_mid_price'].diff(w).shift(-w).fillna(0)
+            tick_data[f'frt_{w}_abs'] = tick_data[f'frt_{w}'].abs()
+            tick_data[f'mdf_frt_{w}'] = (
+                    tick_data['mid_price'].rolling(w, min_periods=1).max().shift(-w) +
+                    tick_data['mid_price'].rolling(w, min_periods=1).min().shift(-w) - 2*tick_data['mid_price']).fillna(0)
+
+    def _preprocess(self, tick_data=None) -> None:
+        """
+        Preprocess the tick data.
+        """
+        if tick_data is None:
+            tick_data = self.tick_data
+
+        if isinstance(tick_data, dict):
+            for night_df, day_df in tick_data.values():
+                self._single_preprocess(night_df)
+                self._single_preprocess(day_df)
+        elif isinstance(tick_data, pd.DataFrame):
+            self._single_preprocess(tick_data)
+        else:
+            raise ValueError('The tick data type is not supported for preprocess.')
+
+    def extern_preprocess(self, tick_data: pd.DataFrame) -> None:
+        self._preprocess(tick_data)
+
+    def factor_analysis(self, factor, frt='frt_60', threshold: float=0.01, bins: int=10, plot: bool=True) -> dict:
+        """
+        The factor analysis.
+        :return:
+        """
+        if self.concat_tick_data is None:
+            self._concat()
+
+        return self.extern_factor_analysis(self.tick_data, self.symbol, factor, frt, threshold, bins, plot)
+
+    @staticmethod
+    def extern_factor_analysis(tick_data, symbol: str, factor: str, frt: str='frt_60', threshold: float=0.01, bins: int=10, plot: bool=True) -> dict:
+        """
+        The external factor analysis.
+        :return:
+        """
+
+        if isinstance(tick_data, dict):
+            concat_tick_data = concat_tuple_data(tick_data)
+        elif isinstance(tick_data, pd.DataFrame):
+            concat_tick_data = tick_data
+        else:
+            raise ValueError('The tick data type is not supported for extern factor analysis concat.')
+
+        title = 'Factor Analysis'
+        info = f'factor name: {factor}\nsymbol: {symbol}\ntarget: {frt}'
+
+        corr        = ic(concat_tick_data[factor], concat_tick_data[frt])
+        corr_len    = ic(concat_tick_data[factor].abs(), concat_tick_data[frt].abs())
+        corr_sgn    = ic(np.sign(concat_tick_data[factor]), np.sign(concat_tick_data[frt]))
+
+        factor_mean = concat_tick_data[factor].mean()
+        factor_std  = concat_tick_data[factor].std()
+
+        r_2 = r_square(concat_tick_data[factor], concat_tick_data[frt])
+        # r_2 = 1 - (c**2 * sum_x_2 + sum_y_2 - 2*c*sum_xy)/frt_var
+
+        threshold = (concat_tick_data[factor].quantile(threshold) - concat_tick_data[factor].quantile(1-threshold))/2
+
+        if isinstance(tick_data, dict):
+
+                # single process
+                b_values = []
+                for single_day_tick_data in tick_data.values():
+                  b_value = backtest_value(
+                      single_day_tick_data,
+                      factor,
+                      symbol,
+                      datetime.time(14, 57),
+                      datetime.time(22, 57),
+                      threshold
+                  )
+
+                  b_values.append(b_value)
+
+                # b_values = backtest_value_parallel(
+                #     tick_data=tick_data,
+                #     factor=factor,
+                #     symbol=symbol,
+                #     day_force_time=datetime.time(14, 57),
+                #     night_force_time=datetime.time(22, 57),
+                #     threshold=threshold)
+
+        elif isinstance(tick_data, pd.DataFrame):
+            b_values = backtest_value(
+                tick_data,
+                factor,
+                symbol,
+                datetime.time(14, 57),
+                datetime.time(22, 57),
+                threshold
+            )
+        else:
+            raise ValueError('The tick data type is not supported for factor analysis.')
+
+        if isinstance(b_values, list):
+            mean_b_value = np.mean(b_values)
+            std_b_value = np.std(b_values)
+        elif isinstance(b_values, float):
+            mean_b_value = b_values
+            std_b_value = 0
+        else:
+            raise ValueError('The backtest value type is error.')
+
+        print(title)
+        print(info)
+        print(tabulate.tabulate([
+            ['factor mean', f'{factor_mean: 6f}'],
+            ['factor std', f'{factor_std: 6f}'],
+            ['corr', f'corr={corr:.4f}, corr_len={corr_len:.4f}, corr_sgn={corr_sgn:.4f}'],
+            ['R_square', f'{r_2: 6f}'],
+            ['backtest value mean', f'{mean_b_value: 6f}'],
+            ['backtest value std', f'{std_b_value: 6f}']
+        ], tablefmt='grid'))
+
+        if plot:
+            factor_discrete = pd.qcut(concat_tick_data[factor], bins, labels=False, duplicates='drop')
+            # right_boundaries = pd.Series([interval.right for interval in factor_discrete])
+            # factor_discrete_values = factor_discrete.unique()
+
+            concat_tick_data['factor_discrete'] = factor_discrete
+            group_data = concat_tick_data.groupby('factor_discrete')
+
+            factor_mean_list = group_data[factor].mean()
+            frt_mean = group_data[frt].mean()
+
+            # frt_std = group_data[frt].transform('std')
+
+            plt.scatter(factor_mean_list, frt_mean)
+            # coeff_cubic = np.polyfit(factor_mean_list, frt_mean, 3)
+            # y_cubic_fit = np.polyval(coeff_cubic, factor_mean_list)
+
+            # plt.plot(factor_mean_list, y_cubic_fit, color='red', label=f'Cubic fit: {coeff_cubic[3]:.2f}x^3 + {coeff_cubic[2]:.2f}x^2 + {coeff_cubic[1]:.2f}x + {coeff_cubic[0]:.2f}')
+            # plt.legend()
+            plt.show()
+
+        analysis_result = {
+            'factor_mean': factor_mean,
+            'factor_std': factor_std,
+            'corr': corr,
+            'r_2': r_2,
+            'b_value': mean_b_value,
+        }
+
+        if plot:
+            analysis_result.update({
+                'factor_mean_list' : factor_mean_list,
+                'frt_mean' : frt_mean,
+            })
+
+        return analysis_result
+
+    def correlation_analysis(self) -> pd.DataFrame:
+        """
+        The correlation analysis.
+        :return:
+        """
+        if self.concat_tick_data is None:
+            self._concat()
+
+        return self.concat_tick_data[self.factors].corr()
+
+    def factor_linear_comb(self, factors: list[str], mean: list[float], std: list[float], weights: list[float], name='comb_factor') -> None:
+        """
+        The factor linear combination.
+        :return:
+        """
+
+        if len(factors) != len(weights):
+            raise ValueError('The length of factors and weights should be the same.')
+
+        for night_df, day_df in self.tick_data.values():
+            gc.collect()
+            night_df[name] = ((night_df[factors] - mean)/std * weights).sum(axis=1)
+            day_df[name] = ((day_df[factors] - mean)/std * weights).sum(axis=1)
+
+        self._concat()
+
+    def generate_factor_abs(self) -> None:
+        """
+        Generate the absolute value of factors.
+        :return:
+        """
+        if isinstance(self.tick_data, dict):
+            factor_name_list = list()
+            for date, (night_df, day_df) in self.tick_data.items():
+                night_concat_dict = dict()
+                day_concat_dict = dict()
+                for factor in self.factors:
+                    factor_name_list.append(f'{factor}_abs')
+                    night_concat_dict.update({f'{factor}_abs': night_df[factor].abs()})
+                    day_concat_dict.update({f'{factor}_abs': day_df[factor].abs()})
+
+                    # self._add_factors([f'{factor}_abs'])
+
+                night_df = pd.concat([night_df, pd.DataFrame(night_concat_dict)], axis=1)
+                day_df = pd.concat([day_df, pd.DataFrame(day_concat_dict)], axis=1)
+
+                self.tick_data[date] = (night_df, day_df)
+            self._add_factors(factor_name_list)
+
+        elif isinstance(self.tick_data, pd.DataFrame):
+            concat_dict = dict()
+            factor_name_list = list()
+            for factor in self.init_factor:
+               factor_name_list.append(f'{factor}_abs')
+               concat_dict[f'{factor}_abs'] = self.tick_data[factor].abs()
+
+               # self._add_factors([f'{factor}_abs'])
+
+            self.tick_data = pd.concat([self.tick_data, pd.DataFrame(concat_dict)], axis=1)
+            self._add_factors(factor_name_list)
+
+        else:
+            raise ValueError('The tick data type is not supported for rolling mean.')
+
+        self._concat()
+
+    def generate_factor_rolling_mean(self, windows: list[int]) -> None:
+        """
+        Generate the mean of factors.
+        :param windows:
+        :return:
+        """
+
+        if isinstance(self.tick_data, dict):
+            for date, (night_df, day_df) in self.tick_data.items():
+                factor_name_list = list()
+                night_concat_dict = dict()
+                day_concat_dict = dict()
+                for factor in self.init_factor:
+                    [factor_name_list.append(f'{factor}_rolling_mean_{w}') for w in windows]
+                    night_concat_dict.update({f'{factor}_rolling_mean_{w}': night_df[factor].rolling(w, min_periods=1).mean() for w in windows})
+                    day_concat_dict.update({f'{factor}_rolling_mean_{w}': day_df[factor].rolling(w, min_periods=1).mean() for w in windows})
+
+                    self._add_factors(factor_name_list)
+
+                night_df = pd.concat([night_df, pd.DataFrame(night_concat_dict)], axis=1)
+                day_df = pd.concat([day_df, pd.DataFrame(day_concat_dict)], axis=1)
+
+                self.tick_data[date] = (night_df, day_df)
+        elif isinstance(self.tick_data, pd.DataFrame):
+            factor_name_list = list()
+            concat_dict = dict()
+            for factor in self.init_factor:
+                [factor_name_list.append(f'{factor}_rolling_mean_{w}') for w in windows]
+                concat_dict.update({f'{factor}_rolling_mean_{w}': self.tick_data[factor].rolling(w, min_periods=1).mean() for w in windows})
+
+                self._add_factors(factor_name_list)
+            self.tick_data = pd.concat([self.tick_data, pd.DataFrame(concat_dict)], axis=1)
+
+        else:
+            raise ValueError('The tick data type is not supported for rolling mean.')
+
+
+        self._concat()
+
+    def _add_factors(self, factor_name_list: list[str]) -> None:
+        for factor_name in factor_name_list:
+            if factor_name not in self.factors:
+                self.factors.append(factor_name)
+
+    def factor_rolling_mean(self, factor: str, window: int) -> None:
+        """
+        Calculate the rolling mean of the factor.
+        :param factor:
+        :param window:
+        :return:
+        """
+        factor_name = factor + f'_rolling_mean_{window}'
+        if isinstance(self.tick_data, dict):
+            for night_df, day_df in self.tick_data.values():
+                night_df[factor_name] = night_df[factor].rolling(window, min_periods=1).mean()
+                day_df[factor_name] = day_df[factor].rolling(window, min_periods=1).mean()
+        elif isinstance(self.tick_data, pd.DataFrame):
+            self.tick_data[factor_name] = self.tick_data[factor].rolling(window, min_periods=1).mean()
+        else:
+            raise ValueError('The tick data type is not supported for rolling mean.')
+
+        self._add_factors([factor_name])
+
+        self._concat()
+
+    def _concat(self, tick_data=None) -> None:
+        """
+        Concatenate the tick data.
+        """
+
+        if tick_data is None:
+            tick_data = self.tick_data
+
+        if isinstance(self.tick_data, dict):
+            self.concat_tick_data = concat_tuple_data(tick_data)
+        elif isinstance(self.tick_data, pd.DataFrame):
+            self.concat_tick_data = self.tick_data
+        else:
+            raise ValueError('The tick data type is not supported for concat.')
+
+    @property
+    def tick_data_type(self) -> str:
+        """
+        Get the tick data type.
+        :return: str
+        """
+        if self.tick_data is dict:
+            return 'dict'
+        elif self.tick_data is pd.DataFrame:
+            return 'DataFrame'
+        else:
+            return 'unknown'
+
+    @staticmethod
+    def vol_slice_imbalance(tick_data):
+        """
+        Calculate the VI.
+        :return:
+        """
+
+        tick_data['vol_slice_imbalance'] = (tick_data[BV[0]] - tick_data[AV[0]])/(tick_data[BV[0]] + tick_data[AV[0]])
+
+    @staticmethod
+    def trade_price_imbalance(tick_data):
+        """
+        Calculate the TPI.
+        :return:
+        """
+
+        tick_data['trade_price_imbalance'] = \
+                (tick_data['ave_price'] - tick_data['mid_price'])*(tick_data['ave_price'] !=0)
+
+    @staticmethod
+    def price_dist(tick_data):
+        """
+        Calculate the price distance.
+        :return:
+        """
+        ask_vol_sum = tick_data[AV].sum(axis=1)
+        bid_vol_sum = tick_data[BV].sum(axis=1)
+        ask_part = (tick_data[AP].values * tick_data[AV].values).sum(axis=1)/ask_vol_sum
+        ask_part = ask_part.rolling(10, min_periods=1).mean()
+        bid_part = (tick_data[BP].values * tick_data[BV].values).sum(axis=1)/bid_vol_sum
+        bid_part = bid_part.rolling(10, min_periods=1).mean()
+
+        ask_dist = (ask_part - tick_data['mid_price'])
+        bid_dist = (tick_data['mid_price'] - bid_part)
+        tick_data['price_dist'] = bid_dist - ask_dist
+
+    @staticmethod
+    def active_buy_vol(tick_data):
+        tick_data['active_buy_vol'] = (tick_data[VOL] > 0) * ((tick_data['ave_price'] >= tick_data[AP[0]].shift(1)) * tick_data[VOL] + (
+(tick_data['ave_price'] < tick_data[AP[0]].shift(1)) & (tick_data['ave_price'] > tick_data[BP[0]].shift(1))) *
+                    tick_data[VOL] * (tick_data['ave_price'] - tick_data[BP[0]].shift(1)) / (
+                                tick_data[AP[0]].shift(1) - tick_data[BP[0]].shift(1)))
+        tick_data['active_buy_vol'] = tick_data['active_buy_vol'].fillna(0)
+
+    @staticmethod
+    def active_sell_vol(tick_data):
+        tick_data['active_sell_vol'] = tick_data[VOL] - tick_data['active_buy_vol']
+
+    @staticmethod
+    def active_buy_sell_imbalance(tick_data):
+        tick_data['active_buy_sell_imbalance'] = (tick_data['active_buy_vol'] - tick_data['active_sell_vol'])/(1+tick_data[VOL])
+
+    @staticmethod
+    def trade_price_vol_imbalance(tick_data):
+        tick_data['trade_price_vol_imbalance'] = tick_data['trade_price_imbalance'] * np.log(
+            1 + (tick_data['active_buy_vol'] - tick_data['active_sell_vol']).abs())
+
+    @staticmethod
+    def price_diff_40(tick_data):
+        tick_data['price_diff_40'] = tick_data['mid_price'].diff(40).fillna(0)
+
+    @staticmethod
+    def price_diff_10(tick_data):
+        tick_data['price_diff_10'] = tick_data['mid_price'].diff(60).fillna(0)
+
+    @staticmethod
+    def order_submit_ask(tick_data):
+        ask_vol_diff = tick_data[AV[0]].diff(1).fillna(0)
+        prev_ask_price = tick_data[AP[0]].shift(1).fillna(0)
+        prev_ask_vol = tick_data[AV[0]].shift(1).fillna(0)
+        prev_ask_2_vol = tick_data[AV[1]].shift(1).fillna(0)
+        tick_data['order_submit_ask'] = ((ask_vol_diff + tick_data['active_buy_vol']) * (tick_data[AP[0]] == prev_ask_price) \
+            + (tick_data['active_buy_vol'] - prev_ask_vol + tick_data[AV[0]] - prev_ask_2_vol) * (tick_data[AP[0]] > prev_ask_price) \
+            + (tick_data[AV[0]] + tick_data['active_buy_vol']) * (tick_data[AP[0]] < prev_ask_price)).round()
+    @staticmethod
+    def order_submit_bid(tick_data):
+        bid_vol_diff = tick_data[BV[0]].diff(1).fillna(0)
+        prev_bid_price = tick_data[BP[0]].shift(1).fillna(0)
+        prev_bid_vol = tick_data[BV[0]].shift(1).fillna(0)
+        prev_bid_2_vol = tick_data[BV[1]].shift(1).fillna(0)
+        tick_data['order_submit_bid'] = ((bid_vol_diff + tick_data['active_sell_vol']) * (tick_data[BP[0]] == prev_bid_price) \
+            + (tick_data['active_sell_vol'] - prev_bid_vol + tick_data[BV[0]] - prev_bid_2_vol) * (tick_data[BP[0]] < prev_bid_price) \
+            + (tick_data[BV[0]] + tick_data['active_sell_vol']) * (tick_data[BP[0]] > prev_bid_price)).round()
+
+    @staticmethod
+    def order_submit_imbalance(tick_data):
+        tick_data['order_submit_imbalance'] = tick_data['order_submit_ask'] - tick_data['order_submit_bid']
+
+    @staticmethod
+    def vol_order_imbalance(tick_data):
+        pre_bid_price = tick_data[BP[0]].shift(1).fillna(tick_data[BP[0]])
+        pre_ask_price = tick_data[AP[0]].shift(1).fillna(tick_data[AP[0]])
+        pre_bid_volume = np.where(
+            tick_data[BP[0]] == pre_bid_price,
+            tick_data[BV[0]].shift(1).fillna(tick_data[BV[0]]),
+            np.where(tick_data[BP[0]] < pre_bid_price, tick_data[BV[1]].shift(1).fillna(tick_data[BV[1]]), 0)
+        )
+        pre_ask_volume = np.where(
+            tick_data[AP[0]] == pre_ask_price,
+            tick_data[AV[0]].shift(1).fillna(tick_data[AV[0]]),
+            np.where(tick_data[AP[0]] > pre_ask_price, tick_data[AV[1]].shift(1).fillna(tick_data[AV[1]]), 0)
+        )
+        delta_bid_volume = tick_data[BV[0]] - pre_bid_volume
+        delta_ask_volume = tick_data[AV[0]] - pre_ask_volume
+        tick_data['vol_order_imbalance'] = delta_bid_volume - delta_ask_volume
+
+    @staticmethod
+    def vol_continue_increase_imbalance(tick_data):
+        bid_vol_diff = tick_data[BV[0]].diff(1).fillna(0)
+        ask_vol_diff = tick_data[AV[0]].diff(1).fillna(0)
+        tick_data['vol_continue_increase_imbalance'] = (
+                max_increase(bid_vol_diff) - max_decrease(bid_vol_diff)
+                - max_increase(ask_vol_diff) + max_decrease(ask_vol_diff))
+
+    @staticmethod
+    def order_flow_imbalance(tick_data):
+        prev_ask_price = tick_data[AP[0]].shift(1).fillna(0)
+        prev_bid_price = tick_data[BP[0]].shift(1).fillna(0)
+        prev_ask_vol = tick_data[AV[0]].shift(1).fillna(0)
+        prev_bid_vol = tick_data[BV[0]].shift(1).fillna(0)
+        tick_data['order_flow_imbalance'] = (tick_data[BP[0]] >= prev_bid_price) * tick_data[BV[0]] - (tick_data[BP[0]] < prev_bid_price) * prev_bid_vol - (
+                    tick_data[AP[0]] <= prev_ask_price) * tick_data[AV[0]] + (tick_data[AP[0]] > prev_ask_price) * prev_ask_vol
+
+    @staticmethod
+    def vol_slice_imbalance_div_std(tick_data):
+        vol_slice_imablance_std = tick_data['vol_slice_imbalance'].rolling(20, min_periods=1).std().fillna(0)
+        tick_data['vol_slice_imbalance_div_std'] = tick_data['vol_slice_imbalance']/(1+vol_slice_imablance_std - 1*(vol_slice_imablance_std!=0))
+
+
+    @staticmethod
+    def vol_time_series_imbalance(tick_data: pd.DataFrame, window=10) -> None:
+        """
+        Calculate the volume time series imbalance.
+        :return:
+        """
+        tick_data['vol_time_series_imbalance'] = \
+                (tick_data[BV[0]]/tick_data[BV[0]].rolling(window, min_periods=1).max() -
+                 tick_data[AV[0]]/tick_data[AV[0]].rolling(window, min_periods=1).max())
+
+    @staticmethod
+    def vol_conv(tick_data):
+        if not tick_data.empty:
+            weight = np.array(
+                [0.04025942, 0.02776354, 0.02156791, 0.02247671, 0.02048048, 0.02905635, 0.05213158, 0.04469997,
+                 -0.42357886])
+
+            conv_size = 9
+            weighted_sum = np.convolve(tick_data['vol_slice_imbalance'], weight[::-1], mode='valid')
+            # 创建一个 Series 对象以保持对齐
+            weighted_sum_series = pd.Series(weighted_sum, index=tick_data.index[conv_size - 1:])
+            tick_data['vol_conv'] = np.nan
+            tick_data.loc[conv_size - 1:, 'vol_conv'] = weighted_sum_series
+            tick_data['vol_conv'] = tick_data['vol_conv'].fillna(0)
+        else:
+            tick_data['vol_conv'] = 0
+
+    @staticmethod
+    def vol_rank_imbalance(tick_data, window=60):
+        ask_rank = optimized_rolling_rank(tick_data[AV[0]], window)
+        bid_rank = optimized_rolling_rank(tick_data[BV[0]], window)
+        tick_data['vol_rank_imbalance'] = ask_rank - bid_rank
+
+    @staticmethod
+    def exp_vol_continue_increase_imbalance(tick_data, alpha=0.5):
+        exp_bid_vol_diff = exp_smooth(tick_data[BV[0]].diff(1).fillna(0), alpha)
+        exp_ask_vol_diff = exp_smooth(tick_data[AV[0]].diff(1).fillna(0), alpha)
+        tick_data['exp_vol_continue_increase_imbalance'] = max_increase(
+            exp_bid_vol_diff) - max_decrease(exp_bid_vol_diff) - max_increase(exp_ask_vol_diff) + max_decrease(
+            exp_ask_vol_diff)
+
+    @staticmethod
+    def vol_diff(tick_data):
+        tick_data['vol_diff'] = tick_data[BV[0]].diff() - tick_data[AV[0]].diff()
+        tick_data['vol_diff'] = tick_data['vol_diff'].fillna(0)
+        tick_data['vol_diff'] = 1 / (1 + np.exp(-tick_data['vol_diff'] / 15)) - 0.5
+
+    @staticmethod
+    def vol_time_series_min_imbalance(tick_data, window=40):
+        bid_rate = tick_data['BidVolume1'].rolling(window, min_periods=1).min() / tick_data['BidVolume1']
+        ask_rate = tick_data['AskVolume1'].rolling(window, min_periods=1).min() / tick_data['AskVolume1']
+        tick_data['vol_time_series_min_imbalance'] = ask_rate - bid_rate
+
+    @staticmethod
+    def vol_max_diff_imbalance(tick_data, window=20):
+        bid_max_diff = (tick_data['BidVolume1'].rolling(window, min_periods=1).max() - tick_data[
+            'BidVolume1'].rolling(20, min_periods=1).min()) / tick_data['BidVolume1']
+        ask_max_diff = (tick_data['AskVolume1'].rolling(window, min_periods=1).max() - tick_data[
+            'AskVolume1'].rolling(20, min_periods=1).min()) / tick_data['AskVolume1']
+        tick_data['vol_max_diff_imbalance'] = ask_max_diff - bid_max_diff
+
+    @staticmethod
+    def effective_spread(tick_data):
+        tick_data['effective_spread'] = (tick_data[LAST_PRICE] - tick_data['mid_price']).rolling(20,
+                                                                                                 min_periods=1).mean()
+    @staticmethod
+    def spread(tick_data):
+        tick_data['spread'] = (tick_data[AP[0]] - tick_data[BP[0]])
