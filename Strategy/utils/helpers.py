@@ -55,6 +55,37 @@ def standardize_stock_column(columns: pd.Index) -> pd.Index:
     return pd.Index([str(c).zfill(6) for c in columns])
 
 
+def normalize_tradedate_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    将宽表行索引 (TRADE_DATE) 统一为 ``DatetimeIndex`` (与 ``pd.Timestamp`` 可比较).
+
+    部分 feather 读入后索引为 ``datetime.date`` 的 object 索引, 而 label 为
+    ``DatetimeIndex``; 则 ``.intersection`` 无公共元素, ``build_panel`` 得到
+    0 行, 进而 ``split_panel`` 报 TRADE_DATE 为 NaT。加载宽表后应始终调用本函数
+    或在 ``build_panel`` 入口对 label/因子统一一次。
+    """
+    out = df.copy()
+    out.index = pd.to_datetime(out.index, errors="coerce")
+    return out
+
+
+def ensure_tradedate_as_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    将宽表规范为「TRADE_DATE 在行索引, 且为时间类型」.
+
+    ``save_wide_table`` 落盘为 ``reset_index().to_feather``, 故 .fea 中
+    **TRADE_DATE 是一列**; 必须 ``set_index('TRADE_DATE')`` 后才是可聚合的
+    宽表。若仅 ``read_feather`` 而未提索引, 会保留 **默认 RangeIndex**,
+    TRADE_DATE 仍留在列中, 与 label 的日期索引做 ``intersection`` 得到空/错位。
+
+    对已从索引正确加载的表, 若列中无 ``TRADE_DATE`` 则仅做 ``normalize``。
+    """
+    out = df.copy()
+    if "TRADE_DATE" in out.columns:
+        out = out.set_index("TRADE_DATE", drop=True)
+    return normalize_tradedate_index(out)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 交易日历
 # ═══════════════════════════════════════════════════════════════════════

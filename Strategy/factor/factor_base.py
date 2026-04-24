@@ -22,6 +22,7 @@ import pandas as pd
 from Strategy import config
 from Strategy.data_io.loader import DailyDataLoader
 from Strategy.data_io.saver import save_wide_table
+from Strategy.utils.helpers import ensure_tradedate_as_index
 
 logger = logging.getLogger(__name__)
 
@@ -151,8 +152,7 @@ def load_factor(name: str) -> pd.DataFrame:
                 "可降低此类损坏概率。"
             ) from e
         raise
-    df = df.set_index("TRADE_DATE")
-    return df
+    return ensure_tradedate_as_index(df)
 
 
 def load_all_factors(names: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:

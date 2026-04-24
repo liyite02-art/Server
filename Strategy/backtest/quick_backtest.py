@@ -2,8 +2,17 @@
 快速分层回测模块: 按打分截面排序分 N 组, 计算等权组合净值。
 
 执行假设:
-- 无滑点成交, 使用 Label 设计时的基准价格 (TWAP) 作为买卖价
-- 单期收益 = 组内股票等权平均收益率
+- 无滑点、无佣金印花税, 使用 Label 设计时的 TWAP 区间收益
+- 单期收益 = 组内股票**收益率的简单平均** (横截面算术平均), 不是真实资金曲线
+
+与 ``event_backtest`` 的差异 (为何曲线往往更好看):
+- group1 约含 len(有效股票)/N 只 (如 20 组时约前 5%), 而 ``BacktestRunner(top_n=50)``
+  只持有 50 只, 二者持仓集合与权重并不相同
+- 分层回测忽略整手、涨跌停无法成交、现金占用等执行摩擦
+- 事件回测有调仓频率、费用; 若 ``rebalance_freq>1``, 持仓在调仓间隔内不随截面更新,
+  与「每日按新 group1 换仓」的隐含假设也不一致
+
+要对齐 group1 选股, 请使用 ``BacktestRunner(mirror_quantile_group=1, n_quantile_groups=20)``。
 """
 from __future__ import annotations
 
@@ -30,6 +39,8 @@ def quantile_backtest(
     score_df: pd.DataFrame,
     label_df: pd.DataFrame,
     n_groups: int = config.N_QUANTILE_GROUPS,
+    start_date: Optional[pd.Timestamp] = None,
+    end_date: Optional[pd.Timestamp] = None,
 ) -> pd.DataFrame:
     """
     每日截面按打分排序, 等分为 n_groups 组, 计算每组等权平均收益率。
@@ -42,6 +53,12 @@ def quantile_backtest(
         Label (收益率) 宽表, 与 score_df 对齐
     n_groups : int
         分组数
+    start_date : pd.Timestamp, optional
+        回测起始日 (含). 默认 None 表示不限制.
+        ⚠️ 强烈建议设置为 config.OOS_START 或 config.VAL_START,
+           避免将训练集日期（样本内）纳入统计，导致虚高收益。
+    end_date : pd.Timestamp, optional
+        回测截止日 (含). 默认 None 表示不限制.
 
     Returns
     -------
@@ -50,6 +67,10 @@ def quantile_backtest(
         每列为该组当日等权平均收益率
     """
     common_dates = score_df.index.intersection(label_df.index).sort_values()
+    if start_date is not None:
+        common_dates = common_dates[common_dates >= pd.Timestamp(start_date)]
+    if end_date is not None:
+        common_dates = common_dates[common_dates <= pd.Timestamp(end_date)]
     common_stocks = score_df.columns.intersection(label_df.columns)
 
     scores = score_df.loc[common_dates, common_stocks]
@@ -184,15 +205,35 @@ def run_quick_backtest(
     n_groups: int = config.N_QUANTILE_GROUPS,
     title: str = "factor | label",
     save_path: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    start_date=None,
+    end_date=None,
 ) -> pd.DataFrame:
     """
     一键运行分层回测: 分组 -> 统计 -> 绘图
+
+    Parameters
+    ----------
+    save_path
+        净值图保存路径 (完整文件名). 若与 ``output_dir`` 同时给出, 以 ``save_path`` 为准.
+    output_dir
+        结果目录; 图保存为 ``{output_dir}/quantile_backtest.png``.
+        未传 ``save_path`` 且未传 ``output_dir`` 时, 使用 ``config.BT_RESULT_DIR``.
+    start_date : date-like, optional
+        回测起始日. 强烈建议传入 config.OOS_START 或 config.VAL_START 以
+        避免样本内日期拉高回测表现.
+    end_date : date-like, optional
+        回测截止日.
 
     Returns
     -------
     pd.DataFrame  各组每日收益率 (同 quantile_backtest 输出)
     """
-    ret_df = quantile_backtest(score_df, label_df, n_groups)
+    if save_path is None and output_dir is not None:
+        save_path = Path(output_dir) / "quantile_backtest.png"
+
+    ret_df = quantile_backtest(score_df, label_df, n_groups,
+                               start_date=start_date, end_date=end_date)
     logger.info("分层回测完成: %d 交易日, %d 组", len(ret_df), n_groups)
 
     for col in ret_df.columns:

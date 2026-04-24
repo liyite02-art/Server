@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 from Strategy import config
 from Strategy.data_io.loader import MinuteDataLoader
 from Strategy.data_io.saver import save_wide_table
-from Strategy.utils.helpers import get_minute_files, date_to_int
+from Strategy.utils.helpers import get_minute_files, date_to_int, ensure_tradedate_as_index
 
 logger = logging.getLogger(__name__)
 
@@ -152,13 +152,11 @@ def load_label(tag: str = "TWAP_1430_1457") -> pd.DataFrame:
     """快捷加载已保存的 Label 宽表"""
     path = config.LABEL_OUTPUT_DIR / f"LABEL_{tag}.fea"
     df = pd.read_feather(path)
-    df = df.set_index("TRADE_DATE")
-    return df
+    return ensure_tradedate_as_index(df)
 
 
 def load_price(tag: str = "TWAP_1430_1457") -> pd.DataFrame:
     """快捷加载已保存的基准价格宽表"""
     path = config.LABEL_OUTPUT_DIR / f"{tag}.fea"
     df = pd.read_feather(path)
-    df = df.set_index("TRADE_DATE")
-    return df
+    return ensure_tradedate_as_index(df)

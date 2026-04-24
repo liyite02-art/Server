@@ -21,8 +21,11 @@ SCORE_OUTPUT_DIR = OUTPUT_DIR / "scores"
 BT_RESULT_DIR = OUTPUT_DIR / "bt_results"
 
 # ── 样本内外划分 ────────────────────────────────────────────────────────
+# 注意: TRAIN/VAL 闭区间; 须与 build_panel 实际有数据的 TRADE_DATE 有交集。
+# 易错: TRAIN_END 若早于 panel 的最早日期，则训练集 0 行。此前默认可写成 8 月 1 日，
+#      会排除 8 月 2 日~31 日，故 END 用当月最后一个自然日更稳妥。
 TRAIN_START = dt.date(2021, 1, 1)
-TRAIN_END = dt.date(2023, 8, 1)
+TRAIN_END = dt.date(2023, 8, 31)
 
 VAL_START = dt.date(2023, 9, 1)
 VAL_END = dt.date(2024, 9, 1)
@@ -50,7 +53,8 @@ DEFAULT_TWAP_END = 1457
 COMMISSION_RATE = 0.0002         # 双向佣金 万二
 STAMP_DUTY_RATE = 0.0005         # 卖出印花税 万五
 SLIPPAGE_BPS = 0.0              # 默认滑点 (bps), 0 = 无滑点
-INITIAL_CAPITAL = 10_000_000.0   # 初始资金 1000 万
+# 与分层回测 / 事件回测「对齐」时的默认本金 (100 万)
+INITIAL_CAPITAL = 10_000_000.0
 
 # ── 分组回测参数 ────────────────────────────────────────────────────────
 N_QUANTILE_GROUPS = 20           # 分层回测组数

@@ -19,12 +19,56 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 
 from Strategy import config
 
 logger = logging.getLogger(__name__)
+
+
+def aggregate_trades_daily(trades: pd.DataFrame) -> pd.DataFrame:
+    """
+    将逐笔订单汇总为「按交易日」的买卖笔数、成交额、佣金、印花税、卖出侧 pnl。
+
+    用于与 quantile_backtest 对比时核对: 事件回测在哪些天成交了多少、费用多少。
+    """
+    cols = [
+        "TRADE_DATE",
+        "n_buy",
+        "n_sell",
+        "buy_notional",
+        "sell_notional",
+        "commission",
+        "stamp_duty",
+        "pnl_on_sells",
+    ]
+    if trades is None or trades.empty:
+        return pd.DataFrame(columns=cols)
+
+    t = trades.copy()
+    t["TRADE_DATE"] = pd.to_datetime(t["date"], errors="coerce").dt.normalize()
+    t = t.dropna(subset=["TRADE_DATE"])
+    t["notional"] = t["filled_shares"].astype(float) * t["actual_price"].astype(float)
+    t["buy_notional"] = np.where(t["side"] == "BUY", t["notional"], 0.0)
+    t["sell_notional"] = np.where(t["side"] == "SELL", t["notional"], 0.0)
+    t["n_buy"] = (t["side"] == "BUY").astype(int)
+    t["n_sell"] = (t["side"] == "SELL").astype(int)
+    t["pnl_sell"] = np.where(t["side"] == "SELL", t["pnl"].astype(float), 0.0)
+
+    g = t.groupby("TRADE_DATE", sort=True).agg(
+        n_buy=("n_buy", "sum"),
+        n_sell=("n_sell", "sum"),
+        buy_notional=("buy_notional", "sum"),
+        sell_notional=("sell_notional", "sum"),
+        commission=("commission", "sum"),
+        stamp_duty=("stamp_duty", "sum"),
+        pnl_on_sells=("pnl_sell", "sum"),
+    ).reset_index()
+    return g
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -243,8 +287,131 @@ class TradeLogger:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# BacktestResult: run() 的返回值，携带 plot() 方法
+# ═══════════════════════════════════════════════════════════════════════
+class BacktestResult:
+    """
+    回测结果容器。
+
+    Attributes
+    ----------
+    nav : pd.DataFrame
+        每日 NAV 记录 (含 cash / position_value / nav / n_positions)
+    trades : pd.DataFrame
+        逐笔订单明细
+    exceptions : pd.DataFrame
+        异常事件记录
+    """
+
+    def __init__(
+        self,
+        nav: pd.DataFrame,
+        trades: pd.DataFrame,
+        exceptions: pd.DataFrame,
+        initial_capital: float,
+    ):
+        self.nav = nav
+        self.trades = trades
+        self.exceptions = exceptions
+        self.initial_capital = initial_capital
+
+    # ------------------------------------------------------------------
+    def plot(
+        self,
+        save_dir: Optional[Path] = None,
+        save_path: Optional[Path] = None,
+        figsize: tuple = (14, 6),
+        title: str = "Event Backtest — NAV",
+    ) -> Path:
+        """
+        绘制净值曲线并保存。
+
+        Parameters
+        ----------
+        save_dir  : 输出目录; 图保存为 {save_dir}/nav_curve.png
+        save_path : 完整文件路径 (与 save_dir 同时提供时以 save_path 优先)
+        """
+        if save_path is None:
+            out_dir = Path(save_dir) if save_dir is not None else config.BT_RESULT_DIR
+            save_path = out_dir / "nav_curve.png"
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        nav_df = self.nav.copy()
+        if "TRADE_DATE" in nav_df.columns:
+            nav_df = nav_df.set_index("TRADE_DATE")
+        nav_df.index = pd.to_datetime(nav_df.index)
+
+        cum_ret = nav_df["nav"] / self.initial_capital - 1
+
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.plot(nav_df.index, cum_ret.values, lw=1.2, label="Strategy")
+        ax.axhline(0, color="gray", lw=0.5, ls="--")
+        ax.set_title(title, fontsize=12)
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Cumulative Return")
+        ax.legend()
+        fig.autofmt_xdate(rotation=45)
+        plt.tight_layout()
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info("NAV 曲线已保存: %s", save_path)
+        return save_path
+
+    def summary(self, annual_days: int = 242) -> dict:
+        """输出关键绩效指标"""
+        nav_df = self.nav.copy()
+        if "TRADE_DATE" in nav_df.columns:
+            nav_df = nav_df.set_index("TRADE_DATE")
+        ret = nav_df["nav"].pct_change().dropna()
+        total = nav_df["nav"].iloc[-1] / self.initial_capital - 1
+        ann = (1 + total) ** (annual_days / max(len(ret), 1)) - 1
+        vol = ret.std() * np.sqrt(annual_days)
+        sharpe = ann / vol if vol > 0 else 0.0
+        cum = (1 + ret).cumprod()
+        mdd = ((cum / cum.cummax()) - 1).min()
+        return {"total_return": total, "ann_return": ann, "ann_vol": vol,
+                "sharpe": sharpe, "max_drawdown": mdd, "n_trades": len(self.trades)}
+
+    def save_details(self, output_dir: Optional[Path] = None) -> Path:
+        """
+        导出回测明细到 CSV:
+
+        - ``nav.csv``              每日 NAV
+        - ``trades_all.csv``       逐笔订单 (每笔一行)
+        - ``exceptions.csv``       涨跌停、缺价等异常
+        - ``daily_trade_summary.csv`` 按日汇总的买卖笔数与金额、费用
+        """
+        out = Path(output_dir or config.BT_RESULT_DIR)
+        out.mkdir(parents=True, exist_ok=True)
+
+        self.nav.to_csv(out / "nav.csv", index=False)
+        self.trades.to_csv(out / "trades_all.csv", index=False)
+        self.exceptions.to_csv(out / "exceptions.csv", index=False)
+        aggregate_trades_daily(self.trades).to_csv(
+            out / "daily_trade_summary.csv", index=False
+        )
+        logger.info(
+            "回测明细已写入 %s: nav.csv, trades_all.csv, exceptions.csv, daily_trade_summary.csv",
+            out,
+        )
+        return out
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # BacktestRunner: 主循环调度
 # ═══════════════════════════════════════════════════════════════════════
+def _load_daily_wide(key: str) -> Optional[pd.DataFrame]:
+    """尝试从 Daily_data/ 读宽表, 不存在时返回 None。"""
+    path = config.DAILY_DATA_DIR / f"{key}.pkl"
+    if not path.exists():
+        return None
+    df = pd.read_pickle(path)
+    df.index = pd.to_datetime(df.index)
+    df.columns = pd.Index([str(c).zfill(6) for c in df.columns])
+    return df
+
+
 class BacktestRunner:
     """
     精细化回测主控器。
@@ -253,16 +420,27 @@ class BacktestRunner:
     ----------
     score_df : pd.DataFrame
         打分宽表 (index=TRADE_DATE, columns=StockID)
-    twap_df : pd.DataFrame
-        TWAP 基准价格宽表
-    limit_up_df : pd.DataFrame
-        涨停价宽表
-    limit_down_df : pd.DataFrame
-        跌停价宽表
+    twap_df : pd.DataFrame, optional
+        TWAP 基准价格宽表; 不传时自动从 outputs/labels/TWAP_1430_1457.fea 加载
+    limit_up_df : pd.DataFrame, optional
+        涨停价宽表; 不传时自动从 Daily_data/LIMIT_UP_PRICE.pkl 加载
+    limit_down_df : pd.DataFrame, optional
+        跌停价宽表; 不传时自动从 Daily_data/LIMIT_DOWN_PRICE.pkl 加载
     top_n : int
-        每日选取打分前 N 只股票买入
+        每日选取打分前 N 只股票买入 (与 ``mirror_quantile_group`` 二选一)
+    mirror_quantile_group : int, optional
+        若设为 ``1`` 且 ``n_quantile_groups=20``, 选股规则与 ``quantile_backtest``
+        的 **group1** 一致 (截面分位第一层, 约前 5% 股票数, 等权含义在分层回测里
+        是「组内收益平均」而非真实组合)。不设时沿用 ``top_n``。
+    n_quantile_groups : int
+        与快速分层回测 ``n_groups`` 对齐, 默认 ``config.N_QUANTILE_GROUPS``
+    rebalance_freq : int
+        调仓频率 (天); 1=每日调仓, 与 ``quantile_backtest`` 的「按日截面」一致
     initial_capital : float
-        初始资金
+        初始资金 (与分层图对比时建议与 ``config.INITIAL_CAPITAL`` 一致, 默认 100 万)
+    frictionless : bool
+        True 时佣金、印花税、滑点均为 0, 与 ``run_quick_backtest`` 的无摩擦假设对齐;
+        实盘检验请设 False。
     commission_rate : float
     stamp_duty_rate : float
     slippage_bps : float
@@ -271,20 +449,49 @@ class BacktestRunner:
     def __init__(
         self,
         score_df: pd.DataFrame,
-        twap_df: pd.DataFrame,
-        limit_up_df: pd.DataFrame,
-        limit_down_df: pd.DataFrame,
+        twap_df: Optional[pd.DataFrame] = None,
+        limit_up_df: Optional[pd.DataFrame] = None,
+        limit_down_df: Optional[pd.DataFrame] = None,
         top_n: int = 50,
+        mirror_quantile_group: Optional[int] = None,
+        n_quantile_groups: int = config.N_QUANTILE_GROUPS,
+        rebalance_freq: int = 1,
         initial_capital: float = config.INITIAL_CAPITAL,
+        frictionless: bool = False,
         commission_rate: float = config.COMMISSION_RATE,
         stamp_duty_rate: float = config.STAMP_DUTY_RATE,
         slippage_bps: float = config.SLIPPAGE_BPS,
     ):
         self.score_df = score_df
+        self.top_n = top_n
+        self.mirror_quantile_group = mirror_quantile_group
+        self.n_quantile_groups = max(1, int(n_quantile_groups))
+        self.rebalance_freq = max(1, int(rebalance_freq))
+        self.frictionless = bool(frictionless)
+        if self.frictionless:
+            commission_rate = 0.0
+            stamp_duty_rate = 0.0
+            slippage_bps = 0.0
+
+        # ── 自动加载价格/涨跌停数据 ──────────────────────────────────
+        if twap_df is None:
+            from Strategy.label.label_generator import load_price
+            twap_df = load_price("TWAP_1430_1457")
+            logger.info("已自动加载 TWAP_1430_1457 价格表, shape=%s", twap_df.shape)
+        if limit_up_df is None:
+            limit_up_df = _load_daily_wide("LIMIT_UP_PRICE")
+            if limit_up_df is None:
+                logger.warning("LIMIT_UP_PRICE.pkl 不存在, 涨停判断将跳过")
+                limit_up_df = pd.DataFrame()
+        if limit_down_df is None:
+            limit_down_df = _load_daily_wide("LIMIT_DOWN_PRICE")
+            if limit_down_df is None:
+                logger.warning("LIMIT_DOWN_PRICE.pkl 不存在, 跌停判断将跳过")
+                limit_down_df = pd.DataFrame()
+
         self.twap_df = twap_df
         self.limit_up_df = limit_up_df
         self.limit_down_df = limit_down_df
-        self.top_n = top_n
 
         self.portfolio = Portfolio(initial_capital)
         self.engine = TradeEngine(commission_rate, stamp_duty_rate, slippage_bps)
@@ -313,13 +520,24 @@ class BacktestRunner:
 
     def _generate_target(self, signal_date: pd.Timestamp) -> List[str]:
         """
-        基于 signal_date (T-1) 的打分生成买入目标。
-        ⚠️ 只使用 signal_date 及之前的数据, 信号基于 T-1 收盘。
+        基于 signal_date 当日 score 生成买入目标。
+
+        ``score_df[T]`` 已是 T-1 日因子可得信息下的打分 (因子宽表做过 shift(1)),
+        与 ``quantile_backtest`` 在日期 T 上用的截面一致。
         """
         if signal_date not in self.score_df.index:
             return []
         scores = self.score_df.loc[signal_date].dropna().sort_values(ascending=False)
-        return list(scores.index[:self.top_n])
+        if self.mirror_quantile_group is not None:
+            g = int(self.mirror_quantile_group)
+            ng = self.n_quantile_groups
+            if g < 1 or g > ng:
+                raise ValueError(f"mirror_quantile_group 须在 [1, {ng}] 内, 当前 {g}")
+            ranks = scores.rank(method="first", ascending=False)
+            gs = len(scores) / ng
+            mask = (ranks > (g - 1) * gs) & (ranks <= g * gs)
+            return list(scores.loc[mask].index)
+        return list(scores.index[: self.top_n])
 
     def _execute_sells(self, trade_date: pd.Timestamp):
         """执行所有卖出 (含延迟卖出的跌停股)"""
@@ -447,43 +665,65 @@ class BacktestRunner:
         self,
         start_date: Optional[pd.Timestamp] = None,
         end_date: Optional[pd.Timestamp] = None,
-    ) -> pd.DataFrame:
+    ) -> "BacktestResult":
         """
         运行回测主循环。
 
-        T-1 日产出信号 -> T 日执行交易 (先卖后买)
+        T-1 日产出信号 -> T 日执行交易 (先卖后买)；
+        ``rebalance_freq`` 控制每隔几天才调一次仓。
 
         Returns
         -------
-        pd.DataFrame  每日 NAV 记录
+        BacktestResult  含 .nav / .trades / .exceptions 及 .plot() / .summary()
         """
         trade_dates = self.twap_df.index.sort_values()
         if start_date is not None:
-            trade_dates = trade_dates[trade_dates >= start_date]
+            trade_dates = trade_dates[trade_dates >= pd.Timestamp(start_date)]
         if end_date is not None:
-            trade_dates = trade_dates[trade_dates <= end_date]
+            trade_dates = trade_dates[trade_dates <= pd.Timestamp(end_date)]
         trade_dates = list(trade_dates)
 
+        if not trade_dates:
+            raise ValueError("回测日期范围内无可用交易日")
+
+        sel = (
+            f"mirror_group{self.mirror_quantile_group}/{self.n_quantile_groups}"
+            if self.mirror_quantile_group is not None
+            else f"top_{self.top_n}"
+        )
         logger.info(
-            "回测开始: %s ~ %s, %d 交易日, top_%d, 初始资金=%.0f",
-            trade_dates[0].strftime("%Y-%m-%d") if trade_dates else "N/A",
-            trade_dates[-1].strftime("%Y-%m-%d") if trade_dates else "N/A",
-            len(trade_dates), self.top_n, self.portfolio.initial_capital,
+            "回测开始: %s ~ %s, %d 交易日, %s, 调仓=%d天, 本金=%.0f, frictionless=%s",
+            trade_dates[0].strftime("%Y-%m-%d"),
+            trade_dates[-1].strftime("%Y-%m-%d"),
+            len(trade_dates),
+            sel,
+            self.rebalance_freq,
+            self.portfolio.initial_capital,
+            self.frictionless,
         )
 
+        rebalance_counter = 0
         for i, trade_date in enumerate(trade_dates):
-            signal_date = trade_dates[i - 1] if i > 0 else None
+            # ⚠️ score_df[T] 已经是用 T-1 日因子打出的分 (因子文件做了 shift(1)),
+            # 代表"T-1 日收盘后可知的信号 → 预测 T→T+1 收益"。
+            # 因此在 T 日交易时, 直接取 score_df.loc[trade_date] 即可,
+            # 无需再往前取 trade_dates[i-1], 否则信号会落后 2 天。
+            signal_date = trade_date
 
-            # 1. 执行卖出 (含跌停延后)
-            self._execute_sells(trade_date)
+            # 1. 执行卖出 (含跌停延后) — 只在调仓日才换仓
+            do_rebalance = (rebalance_counter % self.rebalance_freq == 0)
+            if do_rebalance:
+                self._execute_sells(trade_date)
+            rebalance_counter += 1
 
-            # 2. 生成买入目标 (基于 T-1 信号)
-            targets = []
-            if signal_date is not None:
+            # 2. 生成买入目标 (基于当日 score, 即 T-1 日因子信号)
+            targets: List[str] = []
+            if do_rebalance:
                 targets = self._generate_target(signal_date)
 
             # 3. 执行买入
-            self._execute_buys(trade_date, targets)
+            if do_rebalance:
+                self._execute_buys(trade_date, targets)
 
             # 4. 记录当日 NAV
             price_dict = {}
@@ -511,7 +751,12 @@ class BacktestRunner:
             len(self.trade_logger.orders),
             len(self.exception_tracker.records),
         )
-        return nav_df
+        return BacktestResult(
+            nav=nav_df,
+            trades=self.trade_logger.to_dataframe(),
+            exceptions=self.exception_tracker.to_dataframe(),
+            initial_capital=self.portfolio.initial_capital,
+        )
 
     def get_results(self) -> dict:
         """汇总回测结果"""
@@ -532,6 +777,9 @@ class BacktestRunner:
         results["nav"].to_csv(out / "nav.csv", index=False)
         results["trades"].to_csv(out / "trades.csv", index=False)
         results["exceptions"].to_csv(out / "exceptions.csv", index=False)
+        aggregate_trades_daily(results["trades"]).to_csv(
+            out / "daily_trade_summary.csv", index=False
+        )
 
         logger.info("回测结果已保存: %s", out)
         return out
