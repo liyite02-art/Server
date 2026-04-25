@@ -31,7 +31,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from Strategy import config
-from Strategy.backtest.universe import listing_age_mask, load_ipo_dates, load_st_status, st_mask
+from Strategy.backtest.universe import (
+    listing_age_mask,
+    load_ipo_dates,
+    load_out_dates,
+    load_st_status,
+    out_date_mask,
+    prefix_mask,
+    st_mask,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,17 +85,22 @@ def build_tradeable_mask(
     price_df: Optional[pd.DataFrame] = None,
     limit_up_df: Optional[pd.DataFrame] = None,
     ipo_dates: Optional[pd.Series] = None,
+    out_dates: Optional[pd.Series] = None,
     st_status: Optional[pd.DataFrame] = None,
     exclude_limit_up: bool = True,
     min_listing_days: int = 20,
+    delist_buffer_days: int = 20,
     exclude_st: bool = True,
+    exclude_historical_st: bool = True,
+    excluded_prefixes: Optional[tuple[str, ...]] = ("300", "688"),
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     构建 T 日可知的 quick 回测股票池 mask, 并输出逐日报告。
 
     - price_df 非空: 仅保留 T 日 TWAP 有价格的股票。
     - limit_up_df 非空且 exclude_limit_up=True: 剔除 T 日 TWAP 封涨停、无法买入的股票。
-    - ipo_dates/st_status 非空: 剔除上市不超过 min_listing_days 天的新股和 ST 股票。
+    - ipo_dates/out_dates/st_status 非空: 剔除新股、退市前缓冲期股票和截至 T 日曾经 ST 的股票。
+    - excluded_prefixes: 剔除指定代码前缀, 默认剔除 300/688。
     - 不使用 label 的非空性决定股票池, 避免未来可得性筛选。
     """
     scores = _standardize_wide(score_df)
@@ -98,22 +111,33 @@ def build_tradeable_mask(
         ipo_dates=ipo_dates,
         min_listing_days=min_listing_days,
     )
-    st_ok = st_mask(scores.index, scores.columns, st_status) if exclude_st else pd.DataFrame(
+    delist_ok = out_date_mask(
+        scores.index,
+        scores.columns,
+        out_dates=out_dates,
+        delist_buffer_days=delist_buffer_days,
+    )
+    st_ok = st_mask(scores.index, scores.columns, st_status, historical=exclude_historical_st) if exclude_st else pd.DataFrame(
         True, index=scores.index, columns=scores.columns
     )
-    universe_ok = age_ok & st_ok
+    prefix_ok = prefix_mask(scores.index, scores.columns, excluded_prefixes=excluded_prefixes)
+    universe_ok = age_ok & delist_ok & st_ok & prefix_ok
 
     if price_df is None:
         base = score_valid
         tradeable = score_valid & universe_ok
         new_stock = base & ~age_ok
-        st_excluded = base & age_ok & ~st_ok
+        pre_delist = base & age_ok & ~delist_ok
+        st_excluded = base & age_ok & delist_ok & ~st_ok
+        prefix_excluded = base & age_ok & delist_ok & st_ok & ~prefix_ok
         report = pd.DataFrame(index=scores.index)
         report["score_nonnull"] = score_valid.sum(axis=1)
         report["excluded_no_twap_price"] = 0
         report["excluded_limit_up_cannot_buy"] = 0
         report["excluded_new_stock"] = new_stock.sum(axis=1)
+        report["excluded_pre_delist"] = pre_delist.sum(axis=1)
         report["excluded_st"] = st_excluded.sum(axis=1)
+        report["excluded_prefix"] = prefix_excluded.sum(axis=1)
         report["tradeable"] = tradeable.sum(axis=1)
         report.index.name = "TRADE_DATE"
         return tradeable, report
@@ -123,20 +147,24 @@ def build_tradeable_mask(
     base = score_valid & has_price
     no_price = score_valid & ~has_price
     new_stock = base & ~age_ok
-    st_excluded = base & age_ok & ~st_ok
+    pre_delist = base & age_ok & ~delist_ok
+    st_excluded = base & age_ok & delist_ok & ~st_ok
+    prefix_excluded = base & age_ok & delist_ok & st_ok & ~prefix_ok
 
     limit_up = pd.DataFrame(False, index=scores.index, columns=scores.columns)
     if exclude_limit_up and limit_up_df is not None:
         lu = _standardize_wide(limit_up_df).reindex(index=scores.index, columns=scores.columns)
-        limit_up = base & age_ok & st_ok & _limit_hit(prices, lu)
-    tradeable = base & age_ok & st_ok & ~limit_up
+        limit_up = base & age_ok & delist_ok & st_ok & prefix_ok & _limit_hit(prices, lu)
+    tradeable = base & age_ok & delist_ok & st_ok & prefix_ok & ~limit_up
 
     report = pd.DataFrame(index=scores.index)
     report["score_nonnull"] = score_valid.sum(axis=1)
     report["excluded_no_twap_price"] = no_price.sum(axis=1)
     report["excluded_limit_up_cannot_buy"] = limit_up.sum(axis=1)
     report["excluded_new_stock"] = new_stock.sum(axis=1)
+    report["excluded_pre_delist"] = pre_delist.sum(axis=1)
     report["excluded_st"] = st_excluded.sum(axis=1)
+    report["excluded_prefix"] = prefix_excluded.sum(axis=1)
     report["tradeable"] = tradeable.sum(axis=1)
     report.index.name = "TRADE_DATE"
     return tradeable, report
@@ -445,11 +473,14 @@ def run_quick_backtest(
     price_df: Optional[pd.DataFrame] = None,
     limit_up_df: Optional[pd.DataFrame] = None,
     ipo_dates: Optional[pd.Series] = None,
+    out_dates: Optional[pd.Series] = None,
     st_status: Optional[pd.DataFrame] = None,
     twap_tag: str = "TWAP_1430_1457",
     exclude_limit_up: bool = True,
     min_listing_days: int = 20,
+    delist_buffer_days: int = 20,
     exclude_st: bool = True,
+    excluded_prefixes: Optional[tuple[str, ...]] = ("300", "688"),
 ) -> pd.DataFrame:
     """
     一键运行分层回测: 分组 + topK 等权 -> 统计 -> 绘图
@@ -470,9 +501,11 @@ def run_quick_backtest(
         额外计算 topK 等权日收益并与分组列合并绘图; 默认 ``(50, 100)``. 传空元组 ``()`` 可关闭.
     price_df / limit_up_df
         T 日可知的价格/涨停宽表, 用于构建可交易股票池。默认自动加载当前 TWAP 价格和涨停价。
-    ipo_dates / st_status
-        用于剔除上市不超过 ``min_listing_days`` 天的新股和 ST 股票; 默认自动加载
+    ipo_dates / out_dates / st_status
+        用于剔除新股、退市前缓冲期股票和截至 T 日曾经 ST 的股票; 默认自动加载
         ``Daily_data/ipo_dates.pkl`` 与 ``Daily_data/st_status.pkl``.
+    excluded_prefixes
+        需要剔除的股票代码前缀, 默认 ``("300", "688")``.
 
     Returns
     -------
@@ -488,6 +521,8 @@ def run_quick_backtest(
         limit_up_df = _load_daily_wide("LIMIT_UP_PRICE")
     if ipo_dates is None:
         ipo_dates = load_ipo_dates()
+    if out_dates is None:
+        out_dates = load_out_dates()
     if st_status is None and exclude_st:
         st_status = load_st_status()
     tradeable_mask, universe_report = build_tradeable_mask(
@@ -495,10 +530,13 @@ def run_quick_backtest(
         price_df=price_df,
         limit_up_df=limit_up_df,
         ipo_dates=ipo_dates,
+        out_dates=out_dates,
         st_status=st_status,
         exclude_limit_up=exclude_limit_up,
         min_listing_days=min_listing_days,
+        delist_buffer_days=delist_buffer_days,
         exclude_st=exclude_st,
+        excluded_prefixes=excluded_prefixes,
     )
 
     ret_df, group_diag = quantile_backtest(
@@ -532,13 +570,15 @@ def run_quick_backtest(
                 len(ret_df), n_groups,
                 f", topK={top_ks}" if top_ks else "")
     logger.info(
-        "quick 股票池报告: 平均 score=%d, 可交易=%d, 无TWAP=%d, 涨停无法买入=%d, 新股=%d, ST=%d, group缺label=%d",
+        "quick 股票池报告: 平均 score=%d, 可交易=%d, 无TWAP=%d, 涨停无法买入=%d, 新股=%d, 退市缓冲=%d, ST=%d, 前缀剔除=%d, group缺label=%d",
         int(report["score_nonnull"].mean()) if not report.empty else 0,
         int(report["tradeable"].mean()) if not report.empty else 0,
         int(report["excluded_no_twap_price"].mean()) if not report.empty else 0,
         int(report["excluded_limit_up_cannot_buy"].mean()) if not report.empty else 0,
         int(report["excluded_new_stock"].mean()) if not report.empty else 0,
+        int(report["excluded_pre_delist"].mean()) if not report.empty else 0,
         int(report["excluded_st"].mean()) if not report.empty else 0,
+        int(report["excluded_prefix"].mean()) if not report.empty else 0,
         int(report["group_label_missing"].mean()) if "group_label_missing" in report else 0,
     )
 

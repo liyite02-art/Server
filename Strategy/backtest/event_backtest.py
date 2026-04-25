@@ -37,9 +37,33 @@ import pandas as pd
 import numpy as np
 
 from Strategy import config
-from Strategy.backtest.universe import load_ipo_dates, load_st_status
+from Strategy.backtest.universe import load_ipo_dates, load_out_dates, load_st_status
 
 logger = logging.getLogger(__name__)
+
+
+# region agent log
+def _agent_debug_log(hypothesis_id: str, message: str, data: dict):
+    import json
+    import os
+    import time
+
+    payload = {
+        "sessionId": "da6e13",
+        "runId": "pre-delist-fix",
+        "hypothesisId": hypothesis_id,
+        "location": "Strategy/backtest/event_backtest.py",
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        os.makedirs("/root/autodl-tmp/.cursor", exist_ok=True)
+        with open("/root/autodl-tmp/.cursor/debug-da6e13.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+# endregion
 
 
 # ─── 内部辅助: 加载日频宽表 ────────────────────────────────────────────
@@ -473,7 +497,10 @@ class BacktestRunner:
         slippage_bps: float = config.SLIPPAGE_BPS,
         twap_tag: str = "TWAP_1430_1457",
         min_listing_days: int = 20,
+        delist_buffer_days: int = 20,
         exclude_st: bool = True,
+        exclude_historical_st: bool = True,
+        excluded_prefixes: Optional[tuple[str, ...]] = ("300", "688"),
     ):
         if not (1 <= mirror_quantile_group <= n_quantile_groups):
             raise ValueError(
@@ -490,14 +517,63 @@ class BacktestRunner:
         self.n_quantile_groups = n_quantile_groups
         self.rebalance_freq = rebalance_freq
         self.min_listing_days = min_listing_days
+        self.delist_buffer_days = delist_buffer_days
         self.exclude_st = exclude_st
+        self.exclude_historical_st = exclude_historical_st
+        self.excluded_prefixes = excluded_prefixes or ()
 
         # 自动加载价格/涨跌停数据
         self.twap_df = _load_twap(twap_tag)
         self.limit_up_df   = _load_daily_wide("LIMIT_UP_PRICE")
         self.limit_down_df = _load_daily_wide("LIMIT_DOWN_PRICE")
         self.ipo_dates = load_ipo_dates()
+        self.out_dates = load_out_dates()
         self.st_status_df = load_st_status() if exclude_st else None
+        self.historical_st_df = None
+        if self.st_status_df is not None and self.exclude_historical_st:
+            self.historical_st_df = self.st_status_df.groupby(level=0).max().sort_index().fillna(0).ne(0).cummax()
+
+        # region agent log
+        try:
+            info = pd.read_pickle(config.DAILY_DATA_DIR / "ipo_dates.pkl")
+            row = info.loc[info["TICKER_SYMBOL"].astype(str).str.zfill(6) == "600225"].tail(1)
+            listing_info = row.iloc[0].to_dict() if len(row) else {}
+        except Exception as exc:
+            listing_info = {"error": str(exc)}
+        probe_dates = [pd.Timestamp("2025-02-27"), pd.Timestamp("2025-05-07")]
+        probe = {}
+        for d in probe_dates:
+            st_value = None
+            if self.st_status_df is not None:
+                try:
+                    st_value = self.st_status_df.loc[d, "600225"]
+                except KeyError:
+                    st_value = None
+            historical_st_value = None
+            if self.historical_st_df is not None:
+                try:
+                    historical_st_value = self.historical_st_df.loc[d, "600225"]
+                except KeyError:
+                    historical_st_value = None
+            score_value = None
+            try:
+                score_value = self.score_df.loc[d, "600225"]
+            except KeyError:
+                score_value = None
+            probe[str(d.date())] = {
+                "score": score_value,
+                "twap": self._get_price(d, "600225"),
+                "limit_up": self._get_limit_up(d, "600225"),
+                "limit_down": self._get_limit_down(d, "600225"),
+                "st_status": st_value,
+                "historical_st_status": historical_st_value,
+            }
+        _agent_debug_log(
+            "D1,D2,D3,D4",
+            "600225 listing and data probe at runner init",
+            {"listing_info": listing_info, "probe": probe},
+        )
+        # endregion
 
         # frictionless 模式清零所有费率
         if frictionless:
@@ -536,8 +612,11 @@ class BacktestRunner:
             return np.nan
 
     def _is_universe_eligible(self, date: pd.Timestamp, stock: str) -> bool:
-        """回测股票池: 剔除上市不超过 min_listing_days 天的新股和 ST 股票。"""
+        """回测股票池: 剔除新股、退市前缓冲期、截至 T 日曾经 ST 以及当前无法买入的代码前缀。"""
         stock = str(stock).zfill(6)
+        if self.excluded_prefixes and stock.startswith(self.excluded_prefixes):
+            return False
+
         if self.ipo_dates is not None:
             try:
                 ipo_date = pd.Timestamp(self.ipo_dates.loc[stock])
@@ -546,11 +625,43 @@ class BacktestRunner:
             if pd.isna(ipo_date) or pd.Timestamp(date).normalize() <= ipo_date + pd.Timedelta(days=self.min_listing_days):
                 return False
 
+        if self.out_dates is not None:
+            try:
+                out_date = pd.Timestamp(self.out_dates.loc[stock])
+            except KeyError:
+                out_date = pd.NaT
+            if pd.notna(out_date) and pd.Timestamp(date).normalize() >= out_date - pd.Timedelta(days=self.delist_buffer_days):
+                return False
+
         if self.exclude_st and self.st_status_df is not None:
             try:
                 st_value = self.st_status_df.loc[pd.Timestamp(date).normalize(), stock]
             except KeyError:
                 st_value = 0
+            historical_st_value = False
+            if self.historical_st_df is not None:
+                try:
+                    historical_st_value = bool(self.historical_st_df.loc[pd.Timestamp(date).normalize(), stock])
+                except KeyError:
+                    historical_st_value = False
+            # region agent log
+            if stock == "600225" and pd.Timestamp("2025-02-20") <= pd.Timestamp(date).normalize() <= pd.Timestamp("2025-03-03"):
+                _agent_debug_log(
+                    "D2,D3,H1,H2",
+                    "600225 universe eligibility probe",
+                    {
+                        "date": str(pd.Timestamp(date).date()),
+                        "stock": stock,
+                        "ipo_date": str(self.ipo_dates.loc[stock]) if self.ipo_dates is not None and stock in self.ipo_dates.index else None,
+                        "st_value": st_value,
+                        "historical_st_value": historical_st_value,
+                        "exclude_st": self.exclude_st,
+                        "exclude_historical_st": self.exclude_historical_st,
+                    },
+                )
+            # endregion
+            if historical_st_value:
+                return False
             if pd.notna(st_value) and float(st_value) != 0.0:
                 return False
         return True
@@ -579,7 +690,30 @@ class BacktestRunner:
         scores = scores.loc[tradable]
         n = len(scores)
         if self.top_n is not None:
-            return list(scores.iloc[: min(self.top_n, n)].index)
+            targets = list(scores.iloc[: min(self.top_n, n)].index)
+            # region agent log
+            if "600225" in scores.index or pd.Timestamp(trade_date).normalize() in {pd.Timestamp("2025-02-27"), pd.Timestamp("2025-05-07")}:
+                _agent_debug_log(
+                    "D1,D2,D3",
+                    "600225 target generation probe",
+                    {
+                        "date": str(pd.Timestamp(trade_date).date()),
+                        "stock": "600225",
+                        "score_exists_after_universe_filter": "600225" in scores.index,
+                        "score_value": scores.get("600225", None),
+                        "rank_after_filter": int(scores.index.get_loc("600225")) + 1 if "600225" in scores.index else None,
+                        "in_targets": "600225" in targets,
+                        "target_count": len(targets),
+                        "twap": self._get_price(trade_date, "600225"),
+                        "st_value": self.st_status_df.loc[pd.Timestamp(trade_date).normalize(), "600225"]
+                        if self.st_status_df is not None
+                        and pd.Timestamp(trade_date).normalize() in self.st_status_df.index
+                        and "600225" in self.st_status_df.columns
+                        else None,
+                    },
+                )
+            # endregion
+            return targets
         if n < self.n_quantile_groups:
             return []
         g = self.mirror_quantile_group
@@ -604,6 +738,19 @@ class BacktestRunner:
                 continue
 
             twap = self._get_price(trade_date, stock)
+            # region agent log
+            if stock == "600225":
+                _agent_debug_log(
+                    "D1,D2,D3",
+                    "600225 sell attempt probe",
+                    {
+                        "date": str(pd.Timestamp(trade_date).date()),
+                        "twap": twap,
+                        "is_delayed_sell": stock in self._delayed_sells,
+                        "has_position": self.portfolio.has_position(stock),
+                    },
+                )
+            # endregion
             if np.isnan(twap):
                 self.exception_tracker.log(
                     trade_date, stock, ExceptionType.NO_PRICE_DATA,
@@ -656,6 +803,23 @@ class BacktestRunner:
             if stock in self._delayed_sells or self.portfolio.has_position(stock):
                 continue
             twap = self._get_price(trade_date, stock)
+            # region agent log
+            if stock == "600225":
+                _agent_debug_log(
+                    "D1,D2,D3",
+                    "600225 buy precheck probe",
+                    {
+                        "date": str(pd.Timestamp(trade_date).date()),
+                        "twap": twap,
+                        "limit_up": self._get_limit_up(trade_date, stock),
+                        "st_value": self.st_status_df.loc[pd.Timestamp(trade_date).normalize(), stock]
+                        if self.st_status_df is not None
+                        and pd.Timestamp(trade_date).normalize() in self.st_status_df.index
+                        and stock in self.st_status_df.columns
+                        else None,
+                    },
+                )
+            # endregion
             if np.isnan(twap):
                 self.exception_tracker.log(
                     trade_date, stock, ExceptionType.NO_PRICE_DATA,

@@ -19,9 +19,14 @@ from tqdm.auto import tqdm
 from Strategy import config
 from Strategy.data_io.loader import MinuteDataLoader
 from Strategy.data_io.saver import save_wide_table
-from Strategy.utils.helpers import get_minute_files, date_to_int
+from Strategy.utils.helpers import get_minute_files
 
 logger = logging.getLogger(__name__)
+
+# 分钟线约定买入/卖出时点 (与 main.ipynb 早盘回测一致)
+OPEN0935_1000_TAG = "OPEN0935_1000"
+OPEN0935_TIME = 935
+OPEN1000_TIME = 1000
 
 
 class LabelGenerator:
@@ -208,8 +213,163 @@ class LabelGenerator:
         return price_path, label_path
 
 
+def _compute_day_open_at_time(loader: MinuteDataLoader, date_int: int, time_key: int) -> pd.Series:
+    """单日指定分钟的 open 价 (按 StockID 聚合, 与 MinuteDataLoader 一致已过滤北交所)."""
+    df = loader.load_single_day(date_int)
+    sub = df[df["time"] == time_key]
+    if sub.empty:
+        return pd.Series(dtype=float)
+    return sub.groupby("StockID")["open"].first()
+
+
+def compute_open_wide_table(
+    time_key: int,
+    start_date: Optional[int] = None,
+    end_date: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    从分钟数据提取每个交易日、每只股票在指定 time 的 open 宽表。
+
+    Parameters
+    ----------
+    time_key : int
+        如 935 表示 09:35, 1000 表示 10:00
+    """
+    loader = MinuteDataLoader()
+    files = get_minute_files(start_date, end_date)
+    logger.info("开始计算分钟 open 宽表 time=%s, 共 %d 个交易日", time_key, len(files))
+
+    rows: dict = {}
+    for fpath in tqdm(files, desc=f"Open@{time_key}", unit="day"):
+        date_int = int(fpath.stem)
+        try:
+            s = _compute_day_open_at_time(loader, date_int, time_key)
+            date_key = pd.Timestamp(
+                year=date_int // 10000,
+                month=(date_int % 10000) // 100,
+                day=date_int % 100,
+            )
+            rows[date_key] = s
+        except FileNotFoundError:
+            logger.warning("分钟文件缺失, 跳过: %s", fpath)
+            continue
+
+    out = pd.DataFrame(rows).T.sort_index()
+    out.index.name = "TRADE_DATE"
+    out.columns = pd.Index([str(c).zfill(6) for c in out.columns])
+    logger.info("open 宽表计算完成 time=%s, shape=%s", time_key, out.shape)
+    return out
+
+
+def compute_label_open0935_1000(
+    buy_open: pd.DataFrame,
+    sell_open: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    T 日 09:35 open 买入, T+1 日 10:00 open 卖出的收益率 Label。
+
+    未复权收益:
+        raw(T) = OPEN_1000(T+1) / OPEN_0935(T) - 1
+
+    除息除权调整与 ``compute_label`` 一致 (对齐到 buy_open 的 index/columns):
+        adj(T) = raw_ratio(T) * CLOSE(T) / PRE_CLOSE(T+1) - 1
+        其中 raw_ratio(T) = OPEN_1000(T+1) / OPEN_0935(T)
+
+    最后一行因无 T+1 卖出价而为 NaN。
+    """
+    buy_open = buy_open.sort_index()
+    sell_open = sell_open.sort_index()
+    common_idx = buy_open.index.intersection(sell_open.index).sort_values()
+    common_cols = buy_open.columns.intersection(sell_open.columns)
+    buy_a = buy_open.reindex(index=common_idx, columns=common_cols)
+    sell_a = sell_open.reindex(index=common_idx, columns=common_cols)
+    raw_ratio = sell_a.shift(-1) / buy_a
+
+    close_path = config.DAILY_DATA_DIR / "CLOSE_PRICE.pkl"
+    pre_close_path = config.DAILY_DATA_DIR / "PRE_CLOSE_PRICE.pkl"
+
+    if close_path.exists() and pre_close_path.exists():
+        try:
+            close_df = pd.read_pickle(close_path)
+            close_df.index = pd.DatetimeIndex(close_df.index)
+            close_df.columns = pd.Index([str(c).zfill(6) for c in close_df.columns])
+
+            pre_close_df = pd.read_pickle(pre_close_path)
+            pre_close_df.index = pd.DatetimeIndex(pre_close_df.index)
+            pre_close_df.columns = pd.Index([str(c).zfill(6) for c in pre_close_df.columns])
+
+            common_stocks = (
+                buy_a.columns.intersection(close_df.columns).intersection(pre_close_df.columns)
+            )
+            close_aligned = close_df.reindex(index=buy_a.index, columns=common_stocks)
+            pre_close_aligned = pre_close_df.reindex(index=buy_a.index, columns=common_stocks)
+            adj_factor = close_aligned / pre_close_aligned.shift(-1)
+            adj_factor = adj_factor.reindex(columns=buy_a.columns).fillna(1.0)
+
+            label = raw_ratio.multiply(adj_factor) - 1
+            logger.info(
+                "OPEN0935_1000 Label 除权调整已应用 (CLOSE / PRE_CLOSE), 共 %d 支股票列对齐",
+                len(common_stocks),
+            )
+        except Exception as exc:
+            logger.warning(
+                "OPEN0935_1000 除权调整失败 (%s), 回退未复权: %s",
+                exc.__class__.__name__,
+                exc,
+            )
+            label = raw_ratio - 1
+    else:
+        missing = [p.name for p in (close_path, pre_close_path) if not p.exists()]
+        logger.warning(
+            "缺少文件 %s, OPEN0935_1000 使用未复权 Label",
+            missing,
+        )
+        label = raw_ratio - 1
+
+    label.index.name = "TRADE_DATE"
+    return label
+
+
+def generate_and_save_open0935_1000_label(
+    start_date: Optional[int] = None,
+    end_date: Optional[int] = None,
+    output_dir: Optional[Path] = None,
+    save_price_tables: bool = False,
+) -> Path:
+    """
+    生成并保存 ``LABEL_OPEN0935_1000.fea``，供训练/回测复用。
+
+    另可选保存两张价格锚点宽表 (与 LABEL 同目录):
+    - ``OPEN0935_1000_BUY0935.fea`` : T 日 09:35 open
+    - ``OPEN0935_1000_SELL1000.fea`` : T 日 10:00 open
+
+    加载 Label: ``load_label("OPEN0935_1000")``
+    """
+    out = output_dir or config.LABEL_OUTPUT_DIR
+    buy_open = compute_open_wide_table(OPEN0935_TIME, start_date, end_date)
+    sell_open = compute_open_wide_table(OPEN1000_TIME, start_date, end_date)
+    label = compute_label_open0935_1000(buy_open, sell_open)
+
+    label_path = save_wide_table(label, out / f"LABEL_{OPEN0935_1000_TAG}.fea")
+    logger.info("OPEN0935_1000 Label 已保存: %s, shape=%s", label_path, label.shape)
+
+    if save_price_tables:
+        buy_path = save_wide_table(buy_open, out / f"{OPEN0935_1000_TAG}_BUY0935.fea")
+        sell_path = save_wide_table(sell_open, out / f"{OPEN0935_1000_TAG}_SELL1000.fea")
+        logger.info("价格锚点已保存: %s, %s", buy_path, sell_path)
+
+    return Path(label_path)
+
+
 def load_label(tag: str = "TWAP_1430_1457") -> pd.DataFrame:
-    """快捷加载已保存的 Label 宽表"""
+    """
+    快捷加载已保存的 Label 宽表。
+
+    tag 示例
+    --------
+    - ``"TWAP_1430_1457"`` -> ``LABEL_TWAP_1430_1457.fea``
+    - ``"OPEN0935_1000"`` -> ``LABEL_OPEN0935_1000.fea`` (T 日 09:35 open 买, T+1 日 10:00 open 卖)
+    """
     path = config.LABEL_OUTPUT_DIR / f"LABEL_{tag}.fea"
     df = pd.read_feather(path)
     df = df.set_index("TRADE_DATE")
