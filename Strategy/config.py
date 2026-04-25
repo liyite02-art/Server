@@ -28,9 +28,9 @@ TRAIN_START = dt.date(2021, 1, 1)
 TRAIN_END = dt.date(2023, 8, 31)
 
 VAL_START = dt.date(2023, 9, 1)
-VAL_END = dt.date(2024, 9, 1)
+VAL_END = dt.date(2024, 8, 31)   # 验证集闭区间上界 (含), 须 < OOS_START
 
-OOS_START = dt.date(2024, 9, 1)  # 纯样本外起始，严禁用于任何参数决策
+OOS_START = dt.date(2024, 9, 1)  # 纯样本外起始 (含), 须 > VAL_END; 严禁用于任何参数决策
 
 # 日频因子落盘 (DailyFactorLibraryAdapter.compute_and_save_all)
 # 特征（因子）在验证集、样本外预测与回测中仍然需要，与「标签是否用于训练」无关。

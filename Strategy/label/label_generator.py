@@ -353,6 +353,12 @@ def generate_and_save_open0935_1000_label(
     label_path = save_wide_table(label, out / f"LABEL_{OPEN0935_1000_TAG}.fea")
     logger.info("OPEN0935_1000 Label 已保存: %s, shape=%s", label_path, label.shape)
 
+    # 保存买入价格表作为 scorer 的 T 日可交易 mask 锚点。
+    # scorer._load_current_price_mask 会查找 f"{label_tag}.fea"
+    # 即 OPEN0935_1000.fea; 此处将 09:35 open 宽表保存为该文件名。
+    buy_mask_path = save_wide_table(buy_open, out / f"{OPEN0935_1000_TAG}.fea")
+    logger.info("OPEN0935_1000 买入价格 mask 已保存: %s", buy_mask_path)
+
     if save_price_tables:
         buy_path = save_wide_table(buy_open, out / f"{OPEN0935_1000_TAG}_BUY0935.fea")
         sell_path = save_wide_table(sell_open, out / f"{OPEN0935_1000_TAG}_SELL1000.fea")
