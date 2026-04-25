@@ -466,6 +466,7 @@ class BacktestRunner:
         score_df: pd.DataFrame,
         mirror_quantile_group: int = 1,
         top_n: Optional[int] = None,
+        tail_n: Optional[int] = None,
         n_quantile_groups: int = config.N_QUANTILE_GROUPS,
         rebalance_freq: int = 1,
         initial_capital: float = config.INITIAL_CAPITAL,
@@ -488,10 +489,15 @@ class BacktestRunner:
             raise ValueError("rebalance_freq 必须 >= 1")
         if top_n is not None and top_n < 1:
             raise ValueError("top_n 必须 >= 1")
+        if tail_n is not None and tail_n < 1:
+            raise ValueError("tail_n 必须 >= 1")
+        if top_n is not None and tail_n is not None:
+            raise ValueError("top_n 和 tail_n 不能同时设置")
 
         self.score_df = score_df
         self.mirror_quantile_group = mirror_quantile_group
         self.top_n = top_n
+        self.tail_n = tail_n
         self.n_quantile_groups = n_quantile_groups
         self.rebalance_freq = rebalance_freq
         self.min_listing_days = min_listing_days
@@ -588,10 +594,12 @@ class BacktestRunner:
 
     def _generate_target(self, trade_date: pd.Timestamp) -> List[str]:
         """
-        基于 trade_date 的打分, 按分位组选股。
+        基于 trade_date 的打分生成目标股票列表。
 
-        score_df.loc[T] 已含 shift(1), 仅包含 T-1 收盘后信息。
-        若 top_n 不为空, 取分数最高的 top_n 只; 否则按分位组取第 mirror_quantile_group 组。
+        优先级: top_n > tail_n > mirror_quantile_group
+        - top_n   : 按分数降序取前 N 只（多头）
+        - tail_n  : 按分数升序取前 N 只（最低分，空头参考/反转策略）
+        - 否则按 mirror_quantile_group 分位组取对应区间
         """
         if trade_date not in self.score_df.index:
             return []
@@ -609,9 +617,14 @@ class BacktestRunner:
             tradable.append(stock)
         scores = scores.loc[tradable]
         n = len(scores)
+
         if self.top_n is not None:
-            targets = list(scores.iloc[: min(self.top_n, n)].index)
-            return targets
+            return list(scores.iloc[: min(self.top_n, n)].index)
+
+        if self.tail_n is not None:
+            # 分数最低的 tail_n 只（倒序取末尾）
+            return list(scores.iloc[max(0, n - self.tail_n):].index)
+
         if n < self.n_quantile_groups:
             return []
         g = self.mirror_quantile_group
@@ -842,5 +855,149 @@ class BacktestRunner:
             trades_df=self.trade_logger.to_dataframe(),
             exceptions_df=self.exception_tracker.to_dataframe(),
             initial_capital=self.portfolio.initial_capital,
-            strategy_name=f"top{self.top_n}" if self.top_n is not None else "event_backtest",
+            strategy_name=(
+                f"top{self.top_n}"  if self.top_n  is not None else
+                f"tail{self.tail_n}" if self.tail_n is not None else
+                f"group{self.mirror_quantile_group}of{self.n_quantile_groups}"
+            ),
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# run_batch_event_backtest: 批量运行，输出汇总对比图
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_batch_event_backtest(
+    score_df: pd.DataFrame,
+    top_ns: tuple[int, ...] = (50, 100),
+    tail_ns: tuple[int, ...] = (50, 100),
+    quantile_groups: tuple[int, ...] = (),
+    n_quantile_groups: int = config.N_QUANTILE_GROUPS,
+    start_date=None,
+    end_date=None,
+    rebalance_freq: int = 1,
+    frictionless: bool = False,
+    twap_tag: str = "TWAP_1430_1457",
+    output_dir: Optional[str | Path] = None,
+    title: str = "Event Backtest Comparison",
+    **runner_kwargs,
+) -> Dict[str, BacktestResult]:
+    """
+    批量运行精细回测，输出所有策略的 NAV 汇总对比图。
+
+    Parameters
+    ----------
+    score_df : pd.DataFrame
+        打分宽表
+    top_ns : tuple[int, ...]
+        多头：按分数最高选 N 只，如 (50, 100)
+    tail_ns : tuple[int, ...]
+        空头参考：按分数最低选 N 只，如 (50, 100)
+    quantile_groups : tuple[int, ...]
+        按分位组运行，如 (1, 20) 表示同时跑第1组（最高）和第20组（最低）
+    n_quantile_groups : int
+        总分组数，默认 config.N_QUANTILE_GROUPS
+    start_date / end_date
+        回测日期范围
+    rebalance_freq : int
+        调仓频率（交易日数）
+    frictionless : bool
+        是否忽略所有费率
+    output_dir : Path, optional
+        输出目录，默认 config.BT_RESULT_DIR
+    title : str
+        汇总对比图标题
+    **runner_kwargs
+        透传给 BacktestRunner 的其余参数（如 excluded_prefixes 等）
+
+    Returns
+    -------
+    dict[str, BacktestResult]
+        strategy_name -> BacktestResult
+    """
+    out = Path(output_dir or config.BT_RESULT_DIR)
+    out.mkdir(parents=True, exist_ok=True)
+
+    common_kwargs = dict(
+        score_df=score_df,
+        n_quantile_groups=n_quantile_groups,
+        rebalance_freq=rebalance_freq,
+        frictionless=frictionless,
+        twap_tag=twap_tag,
+        **runner_kwargs,
+    )
+
+    # 构建所有运行配置
+    run_specs: list[dict] = []
+    for n in top_ns:
+        run_specs.append({"top_n": n})
+    for n in tail_ns:
+        run_specs.append({"tail_n": n})
+    for g in quantile_groups:
+        run_specs.append({"mirror_quantile_group": g})
+
+    results: Dict[str, BacktestResult] = {}
+    nav_series: Dict[str, pd.Series] = {}
+
+    for spec in run_specs:
+        runner = BacktestRunner(**common_kwargs, **spec)
+        result = runner.run(start_date=start_date, end_date=end_date)
+        result.save_details(out)
+        results[result.strategy_name] = result
+
+        if not result.nav_df.empty:
+            nav = result.nav_df.set_index("TRADE_DATE")["nav"] if "TRADE_DATE" in result.nav_df.columns else result.nav_df["nav"]
+            nav_series[result.strategy_name] = nav / runner.portfolio.initial_capital
+
+    # ── 汇总对比图 ────────────────────────────────────────────────────
+    if nav_series:
+        fig, ax = plt.subplots(figsize=(14, 6))
+        oos_ts = pd.Timestamp(config.OOS_START)
+
+        top_names  = [k for k in nav_series if k.startswith("top")]
+        tail_names = [k for k in nav_series if k.startswith("tail")]
+        grp_names  = [k for k in nav_series if k.startswith("group")]
+
+        color_map = {
+            "top":   plt.cm.Blues,
+            "tail":  plt.cm.Oranges,
+            "group": plt.cm.Greens,
+        }
+        for group_names, cmap_key in [(top_names, "top"), (tail_names, "tail"), (grp_names, "group")]:
+            cmap = color_map[cmap_key]
+            for j, name in enumerate(group_names):
+                nav = nav_series[name]
+                color = cmap(0.4 + 0.5 * j / max(len(group_names) - 1, 1))
+                perf_nav = nav.pct_change().dropna()
+                ann_ret  = perf_nav.mean() * 242
+                max_dd   = ((nav / nav.cummax()) - 1).min()
+                sharpe   = ann_ret / (perf_nav.std() * np.sqrt(242) + 1e-8)
+                label_txt = f"{name}: Ann={ann_ret:.1%} MDD={max_dd:.1%} SR={sharpe:.2f}"
+                x_all = np.arange(len(nav))
+                ax.plot(x_all, nav.values, lw=1.3, label=label_txt, color=color)
+
+        # OOS 分隔线
+        if nav_series:
+            sample_nav = next(iter(nav_series.values()))
+            idx = pd.DatetimeIndex(sample_nav.index)
+            split_pos = idx.searchsorted(oos_ts)
+            if 0 < split_pos < len(idx):
+                ax.axvline(split_pos - 0.5, color="black", ls="--", lw=0.8, alpha=0.7)
+                ax.text(split_pos, float(max(s.max() for s in nav_series.values())),
+                        "OOS", fontsize=8, va="top", color="black")
+            step = max(len(idx) // 12, 1)
+            ticks = list(range(0, len(idx), step))
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([str(idx[i])[:10] for i in ticks], rotation=45, fontsize=7)
+
+        ax.axhline(1.0, color="gray", lw=0.5)
+        ax.set_title(title, fontsize=12)
+        ax.set_ylabel("Net Value", fontsize=10)
+        ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0)
+        plt.tight_layout()
+        fig_path = out / "event_batch_nav_compare.png"
+        fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info("批量回测汇总图已保存: %s", fig_path)
+
+    return results

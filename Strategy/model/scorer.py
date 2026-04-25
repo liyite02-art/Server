@@ -2,19 +2,24 @@
 模型打分模块: 使用训练好的模型对全市场股票生成每日标准化打分。
 
 输出: 标准宽表 (index=TRADE_DATE, columns=股票代码, values=打分)
+
+支持任意实现 predict(df) -> np.ndarray 接口的模型:
+- XGBTrainer
+- TransformerTrainer
+- 其他自定义模型
 """
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import numpy as np
 
 from Strategy import config
 from Strategy.data_io.saver import save_wide_table
-from Strategy.model.trainer import XGBTrainer, build_panel
+from Strategy.model.trainer import build_panel
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +55,7 @@ def mask_scores_by_current_price(
 
 
 def score_all(
-    trainer: XGBTrainer,
+    trainer: Any,
     panel: pd.DataFrame,
     normalize: bool = True,
 ) -> pd.DataFrame:
@@ -59,8 +64,8 @@ def score_all(
 
     Parameters
     ----------
-    trainer : XGBTrainer
-        已训练好的模型
+    trainer : XGBTrainer | TransformerTrainer | Any
+        已训练好的模型, 需实现 predict(df) -> np.ndarray
     panel : pd.DataFrame
         含因子列的 Panel 长表
     normalize : bool
@@ -86,7 +91,7 @@ def score_all(
 
 
 def generate_scores(
-    trainer: XGBTrainer,
+    trainer: Any,
     factor_dict: Dict[str, pd.DataFrame],
     label_df: pd.DataFrame,
     model_name: str = "xgb",
@@ -99,8 +104,8 @@ def generate_scores(
 
     Parameters
     ----------
-    trainer : XGBTrainer
-        已训练好的模型
+    trainer : XGBTrainer | TransformerTrainer | Any
+        已训练好的模型, 需实现 predict(df) -> np.ndarray
     factor_dict : dict
         {factor_name: wide_df}
     label_df : pd.DataFrame

@@ -6,8 +6,8 @@ from pathlib import Path
 import datetime as dt
 
 # ── 根目录 ──────────────────────────────────────────────────────────────
-PROJECT_ROOT = Path("/root/autodl-tmp/Strategy")
-DATA_ROOT = Path("/root/autodl-tmp")
+PROJECT_ROOT = Path("D:/Quantitative_Investment/Strategy")
+DATA_ROOT = Path("D:/Quantitative_Investment")
 
 # ── 原始数据路径 ────────────────────────────────────────────────────────
 MIN_DATA_DIR = DATA_ROOT / "min_data"          # 分钟频: {year}/{YYYYMMDD}.fea
@@ -31,6 +31,12 @@ VAL_START = dt.date(2023, 9, 1)
 VAL_END = dt.date(2024, 8, 31)   # 验证集闭区间上界 (含), 须 < OOS_START
 
 OOS_START = dt.date(2024, 9, 1)  # 纯样本外起始 (含), 须 > VAL_END; 严禁用于任何参数决策
+
+# ── 滚动训练参数 ────────────────────────────────────────────────────────
+ROLLING_VAL_MONTHS = 3            # 每个 Fold 验证窗口（月数）
+
+# ── Label 预处理 ────────────────────────────────────────────────────────
+LABEL_WINSORIZE_SIGMA = 3.0       # 截面 Winsorize 阈值（σ 倍数）, 0 = 不做
 
 # 日频因子落盘 (DailyFactorLibraryAdapter.compute_and_save_all)
 # 特征（因子）在验证集、样本外预测与回测中仍然需要，与「标签是否用于训练」无关。

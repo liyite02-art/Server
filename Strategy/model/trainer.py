@@ -50,6 +50,95 @@ def _normalize_xgb_params(params: dict) -> dict:
     return p
 
 
+def _winsorize_label_cross_section(
+    panel: pd.DataFrame,
+    sigma: float = 3.0,
+) -> pd.DataFrame:
+    """
+    对 label 做截面 Winsorize: 每日截面内 clip 到 [μ-σ·sigma, μ+σ·sigma]。
+    减少极端收益对 WPCC 梯度的干扰。
+    """
+    if sigma <= 0:
+        return panel
+    out = panel.copy()
+    dates = pd.to_datetime(out["TRADE_DATE"])
+    for dt_val in dates.unique():
+        mask = dates == dt_val
+        y = out.loc[mask, "label"]
+        mu, s = y.mean(), y.std()
+        if s > 1e-12:
+            out.loc[mask, "label"] = y.clip(mu - sigma * s, mu + sigma * s)
+    n_clipped = int((out["label"] != panel["label"]).sum())
+    if n_clipped > 0:
+        logger.info("Label Winsorize (%.1fσ): %d 个样本被截断 (%.2f%%)",
+                    sigma, n_clipped, 100 * n_clipped / max(len(panel), 1))
+    return out
+
+
+def _make_wpcc_objective(date_ids: np.ndarray):
+    """
+    为 XGBoost 生成 WPCC 自定义目标函数。
+
+    数学:
+      PCC_t = Cov(\hat{y}, y) / (σ_{\hat{y}} · σ_y)
+      grad_j = -(1/(n·σ_\hat{y}·σ_y)) · [e_j - PCC · (σ_y/σ_\hat{y}) · d_j]
+      hess_j ≈ 1/(n · σ_\hat{y} · σ_y)  (Fisher scoring)
+    """
+    unique_dates = np.unique(date_ids)
+    date_slices = {d: np.where(date_ids == d)[0] for d in unique_dates}
+
+    def wpcc_obj(predt, dtrain):
+        labels = dtrain.get_label()
+        grad = np.zeros_like(predt)
+        hess = np.full_like(predt, 1e-6)  # 默认小正数
+
+        for idx in date_slices.values():
+            if len(idx) < 10:
+                continue
+            yh = predt[idx]
+            y  = labels[idx]
+            n  = len(idx)
+
+            d = yh - yh.mean()  # \hat{y} centered
+            e = y  - y.mean()   # y centered
+            s_yh = np.sqrt(np.mean(d ** 2)) + 1e-8
+            s_y  = np.sqrt(np.mean(e ** 2)) + 1e-8
+            pcc  = np.mean(d * e) / (s_yh * s_y)
+
+            coeff = 1.0 / (n * s_yh * s_y)
+            grad[idx] = -coeff * (e - pcc * (s_y / s_yh) * d)
+            hess[idx] = coeff
+
+        return grad, hess
+
+    return wpcc_obj
+
+
+def _make_wpcc_eval(date_ids: np.ndarray):
+    """为 XGBoost 生成 WPCC 评估函数 (输出截面平均 IC)。"""
+    unique_dates = np.unique(date_ids)
+    date_slices = {d: np.where(date_ids == d)[0] for d in unique_dates}
+
+    def wpcc_eval(predt, dtrain):
+        labels = dtrain.get_label()
+        corrs = []
+        for idx in date_slices.values():
+            if len(idx) < 10:
+                continue
+            yh = predt[idx]
+            y  = labels[idx]
+            d = yh - yh.mean()
+            e = y  - y.mean()
+            s_yh = np.sqrt(np.mean(d ** 2))
+            s_y  = np.sqrt(np.mean(e ** 2))
+            if s_yh < 1e-10 or s_y < 1e-10:
+                continue
+            corrs.append(np.mean(d * e) / (s_yh * s_y))
+        return "wpcc", float(-np.mean(corrs)) if corrs else 0.0  # 负值，XGB 最小化
+
+    return wpcc_eval
+
+
 def _align_panel_key_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     """
     统一 merge 键类型。feather/宽表重载后，TRADE_DATE 常出现一侧 datetime64 一侧
@@ -211,25 +300,31 @@ class XGBTrainer:
     def __init__(
         self,
         params: Optional[dict] = None,
-        num_boost_round: int = 500,
-        early_stopping_rounds: int = 50,
+        num_boost_round: int = 1500,
+        early_stopping_rounds: int = 80,
+        use_wpcc: bool = True,
+        label_winsorize_sigma: float = config.LABEL_WINSORIZE_SIGMA,
     ):
         self.params = _normalize_xgb_params(
             params
             or {
-                "objective": "reg:squarederror",
-                "eval_metric": "rmse",
-                "max_depth": 6,
-                "learning_rate": 0.05,
-                "subsample": 0.8,
-                "colsample_bytree": 0.8,
-                "min_child_weight": 50,
+                # 防过拟合超参
+                "max_depth": 4,
+                "learning_rate": 0.02,
+                "subsample": 0.7,
+                "colsample_bytree": 0.6,
+                "min_child_weight": 100,
+                "max_leaves": 31,
+                "reg_alpha": 0.1,
+                "reg_lambda": 5.0,
                 "tree_method": "hist",
                 "verbosity": 0,
             }
         )
         self.num_boost_round = num_boost_round
         self.early_stopping_rounds = early_stopping_rounds
+        self.use_wpcc = use_wpcc
+        self.label_winsorize_sigma = label_winsorize_sigma
         self.model = None
         self.feature_names: List[str] = []
 
@@ -246,6 +341,9 @@ class XGBTrainer:
         """
         训练 XGBoost 模型。
 
+        当 use_wpcc=True 时，使用 WPCC 自定义目标函数直接优化截面 IC；
+        否则回退到 MSE (reg:squarederror)。
+
         Parameters
         ----------
         train_df : pd.DataFrame
@@ -256,54 +354,45 @@ class XGBTrainer:
         import xgboost as xgb
 
         self.feature_names = self._get_feature_cols(train_df)
-        logger.info("特征数=%d, 前若干列名(若有): %s", len(self.feature_names), self.feature_names[:8])
+        logger.info("特征数=%d", len(self.feature_names))
         if not self.feature_names:
-            raise ValueError("无特征列: 请确认 panel 中除 TRADE_DATE/StockID/label 外有因子列")
+            raise ValueError("无特征列")
+
+        # ── Label Winsorize ──────────────────────────────────────────
+        if self.label_winsorize_sigma > 0:
+            train_df = _winsorize_label_cross_section(train_df, self.label_winsorize_sigma)
+            if val_df is not None:
+                val_df = _winsorize_label_cross_section(val_df, self.label_winsorize_sigma)
 
         train_clean = train_df.dropna(subset=["label"])
         y_train = train_clean["label"].values.astype(np.float64)
         if y_train.size == 0:
-            raise ValueError(
-                "训练集在 dropna(subset=[label]) 后 0 行: 请检查 label 与 TRAIN 日期交叠"
-            )
+            raise ValueError("训练集 dropna(label) 后 0 行")
         if not np.isfinite(y_train).all():
-            raise ValueError(
-                "训练集 label 含 inf/NaN，请先检查 LABEL 与 merge 结果"
-            )
+            raise ValueError("训练集 label 含 inf/NaN")
         if float(np.std(y_train)) < 1e-12:
-            raise ValueError(
-                "训练集 label 为常数 (std<1e-12)；无法学习且会显示 train/val-rmse:0.00000。"
-                "请检查 LABEL .fea 是否为真实 forward 收益、以及 build_panel 中因子列是否与 label 行对齐（特征全 NaN 时也可能得到虚假 RMSE=0）。"
-            )
+            raise ValueError("训练集 label 为常数")
 
         X_train = (
             train_clean[self.feature_names]
             .apply(pd.to_numeric, errors="coerce")
             .to_numpy(dtype=np.float64)
         )
-        x_nan = float(np.isnan(X_train).mean())
         logger.info(
-            "训练样本 n=%d; label: min=%.6g med=%.6g max=%.6g std=%.6g; 特征全表 NaN 占比=%.2f%%",
-            len(y_train),
-            float(np.nanmin(y_train)),
-            float(np.nanmedian(y_train)),
-            float(np.nanmax(y_train)),
-            float(np.nanstd(y_train)),
-            100.0 * x_nan,
+            "训练样本 n=%d; label std=%.6g; 特征 NaN=%.2f%%",
+            len(y_train), float(np.nanstd(y_train)),
+            100.0 * float(np.isnan(X_train).mean()),
         )
-        if x_nan > 0.99:
-            logger.warning(
-                "特征全表 NaN 占比>99%%: 与因子/label 的日期或股票代码列 merge 可能未对齐, 将难以训练出有效树"
-            )
 
         dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=self.feature_names)
 
         evals = [(dtrain, "train")]
+        val_date_ids = None
         if val_df is not None:
             val_clean = val_df.dropna(subset=["label"])
             y_val = val_clean["label"].values.astype(np.float64)
             if y_val.size == 0:
-                raise ValueError("验证集在 dropna(subset=[label]) 后 0 行")
+                raise ValueError("验证集 dropna(label) 后 0 行")
             X_val = (
                 val_clean[self.feature_names]
                 .apply(pd.to_numeric, errors="coerce")
@@ -311,12 +400,41 @@ class XGBTrainer:
             )
             dval = xgb.DMatrix(X_val, label=y_val, feature_names=self.feature_names)
             evals.append((dval, "val"))
+            # 验证集的日期分组 (用于 WPCC eval)
+            val_date_ids = pd.factorize(
+                pd.to_datetime(val_clean["TRADE_DATE"]).values
+            )[0]
+
+        # ── WPCC 或 MSE ───────────────────────────────────────────
+        obj_fn = None
+        custom_metric = None
+        params = dict(self.params)
+
+        if self.use_wpcc:
+            # 训练集日期分组
+            train_date_ids = pd.factorize(
+                pd.to_datetime(train_clean["TRADE_DATE"]).values
+            )[0]
+            obj_fn = _make_wpcc_objective(train_date_ids)
+            # eval: 用验证集的日期分组 (若有验证集)
+            if val_date_ids is not None:
+                custom_metric = _make_wpcc_eval(val_date_ids)
+            # 移除内置 objective/eval_metric，用自定义的
+            params.pop("objective", None)
+            params.pop("eval_metric", None)
+            logger.info("使用 WPCC 自定义目标函数")
+        else:
+            params.setdefault("objective", "reg:squarederror")
+            params.setdefault("eval_metric", "rmse")
+            logger.info("使用 MSE 目标函数")
 
         self.model = xgb.train(
-            self.params,
+            params,
             dtrain,
             num_boost_round=self.num_boost_round,
             evals=evals,
+            obj=obj_fn,
+            custom_metric=custom_metric,
             early_stopping_rounds=self.early_stopping_rounds if val_df is not None else None,
             verbose_eval=100,
         )

@@ -40,6 +40,7 @@ from Strategy.backtest.universe import (
     prefix_mask,
     st_mask,
 )
+from Strategy.backtest.ic_analysis import run_ic_analysis
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +265,7 @@ def topk_equal_weight_returns(
     score_df: pd.DataFrame,
     label_df: pd.DataFrame,
     ks: tuple[int, ...] = (50, 100),
+    tail_ks: tuple[int, ...] = (),
     start_date: Optional[pd.Timestamp] = None,
     end_date: Optional[pd.Timestamp] = None,
     tradeable_mask: Optional[pd.DataFrame] = None,
@@ -300,17 +302,29 @@ def topk_equal_weight_returns(
         if len(s) < 1:
             continue
 
-        ranks = s.rank(method="first", ascending=False)
+        ranks_desc = s.rank(method="first", ascending=False)  # 1 = 最高分
+        ranks_asc  = s.rank(method="first", ascending=True)   # 1 = 最低分
         row: dict = {}
         diag_row: dict = {}
+
         for k in ks:
             col = f"top{k}"
             take = min(k, len(s))
-            mask = ranks <= take
+            mask = ranks_desc <= take
             selected_ret = r.loc[mask]
             row[col] = selected_ret.dropna().mean() if mask.any() else np.nan
             diag_row[f"{col}_selected"] = int(mask.sum())
             diag_row[f"{col}_label_missing"] = int(selected_ret.isna().sum())
+
+        for k in tail_ks:
+            col = f"tail{k}"
+            take = min(k, len(s))
+            mask = ranks_asc <= take
+            selected_ret = r.loc[mask]
+            row[col] = selected_ret.dropna().mean() if mask.any() else np.nan
+            diag_row[f"{col}_selected"] = int(mask.sum())
+            diag_row[f"{col}_label_missing"] = int(selected_ret.isna().sum())
+
         rows[date] = row
         diagnostics[date] = diag_row
 
@@ -327,12 +341,13 @@ def topk_equal_weight_returns(
 # 绩效统计
 # ═══════════════════════════════════════════════════════════════════════
 def calc_performance(ret_series: pd.Series, annual_days: int = 242) -> dict:
-    """计算单利年化收益、年化波动、最大回撤、夏普比率"""
+    """计算单利年化收益、年化波动、最大回撤、夏普比率、胜率"""
     total_ret = (1 + ret_series).prod() - 1
     n_days = len(ret_series)
     ann_ret = ret_series.mean() * annual_days
     ann_vol = ret_series.std() * np.sqrt(annual_days)
     sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
+    win_rate = float((ret_series > 0).mean()) if n_days > 0 else np.nan
 
     cum = (1 + ret_series).cumprod()
     rolling_max = cum.cummax()
@@ -344,6 +359,7 @@ def calc_performance(ret_series: pd.Series, annual_days: int = 242) -> dict:
         "ann_vol": ann_vol,
         "max_drawdown": max_drawdown,
         "sharpe": sharpe,
+        "win_rate": win_rate,
         "total_ret": total_ret,
         "n_days": n_days,
     }
@@ -394,7 +410,8 @@ def plot_quantile_nav(
         perf = calc_performance(ret_df[col].dropna())
         label_text = (
             f"{col}, {perf['ann_ret']:.2%}, "
-            f"{perf['max_drawdown']:.2%}, {perf['sharpe']:.2f}"
+            f"MDD {perf['max_drawdown']:.2%}, SR {perf['sharpe']:.2f}, "
+            f"WR {perf['win_rate']:.2%}"
         )
         color = default_colors[i % len(default_colors)]
         ax.plot(range(len(cum_ret)), cum_ret[col].values, label=label_text, color=color, lw=1.0)
@@ -408,7 +425,8 @@ def plot_quantile_nav(
         perf = calc_performance(ret_df[col].dropna())
         label_text = (
             f"{col}, {perf['ann_ret']:.2%}, "
-            f"{perf['max_drawdown']:.2%}, {perf['sharpe']:.2f}"
+            f"MDD {perf['max_drawdown']:.2%}, SR {perf['sharpe']:.2f}, "
+            f"WR {perf['win_rate']:.2%}"
         )
         ax.plot(
             range(len(cum_ret)),
@@ -470,6 +488,7 @@ def run_quick_backtest(
     start_date=None,
     end_date=None,
     top_ks: tuple[int, ...] = (50, 100),
+    tail_ks: tuple[int, ...] = (50, 100),
     price_df: Optional[pd.DataFrame] = None,
     limit_up_df: Optional[pd.DataFrame] = None,
     ipo_dates: Optional[pd.Series] = None,
@@ -481,40 +500,40 @@ def run_quick_backtest(
     delist_buffer_days: int = 20,
     exclude_st: bool = True,
     excluded_prefixes: Optional[tuple[str, ...]] = ("300", "688"),
+    run_ic: bool = True,
+    ic_rolling_window: int = 20,
 ) -> pd.DataFrame:
     """
-    一键运行分层回测: 分组 + topK 等权 -> 统计 -> 绘图
+    一键运行快速回测，输出两张图：
+      1. quantile_backtest.png  — N 组分层 NAV 曲线
+      2. topN_tailN_nav.png     — TopK / TailK 等权 NAV 对比曲线
+    可选同步运行 IC/Rank IC 分析。
 
     Parameters
     ----------
-    save_path
-        净值图保存路径 (完整文件名). 若与 ``output_dir`` 同时给出, 以 ``save_path`` 为准.
-    output_dir
-        结果目录; 图保存为 ``{output_dir}/quantile_backtest.png``.
-        未传 ``save_path`` 且未传 ``output_dir`` 时, 使用 ``config.BT_RESULT_DIR``.
-    start_date : date-like, optional
-        回测起始日. 强烈建议传入 config.OOS_START 或 config.VAL_START 以
-        避免样本内日期拉高回测表现.
-    end_date : date-like, optional
-        回测截止日.
     top_ks : tuple[int, ...]
-        额外计算 topK 等权日收益并与分组列合并绘图; 默认 ``(50, 100)``. 传空元组 ``()`` 可关闭.
-    price_df / limit_up_df
-        T 日可知的价格/涨停宽表, 用于构建可交易股票池。默认自动加载当前 TWAP 价格和涨停价。
-    ipo_dates / out_dates / st_status
-        用于剔除新股、退市前缓冲期股票和截至 T 日曾经 ST 的股票; 默认自动加载
-        ``Daily_data/ipo_dates.pkl`` 与 ``Daily_data/st_status.pkl``.
-    excluded_prefixes
-        需要剔除的股票代码前缀, 默认 ``("300", "688")``.
+        TopK（最高分前 K 只）等权日收益; 默认 ``(50, 100)``.
+    tail_ks : tuple[int, ...]
+        TailK（最低分后 K 只，空头参考）等权日收益; 默认 ``(50, 100)``.
+    run_ic : bool
+        是否同步运行 IC/Rank IC 分析（默认 True）。
+    ic_rolling_window : int
+        IC 滚动均线窗口（交易日数），默认 20。
+    其余参数含义同 quantile_backtest / build_tradeable_mask。
 
     Returns
     -------
     pd.DataFrame
-        各组每日收益率列 ``group*``; 若启用 topK, 另含 ``top{k}`` 列 (与分组行对齐).
+        各组每日收益率（``group*`` 列）。
     """
-    if save_path is None and output_dir is not None:
-        save_path = Path(output_dir) / "quantile_backtest.png"
+    out_dir = Path(output_dir or config.BT_RESULT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
+    if save_path is None:
+        save_path = out_dir / "quantile_backtest.png"
+    save_path = Path(save_path)
+
+    # ── 加载辅助数据 ─────────────────────────────────────────────────
     if price_df is None:
         price_df = _load_twap_price(twap_tag)
     if limit_up_df is None and exclude_limit_up:
@@ -525,6 +544,7 @@ def run_quick_backtest(
         out_dates = load_out_dates()
     if st_status is None and exclude_st:
         st_status = load_st_status()
+
     tradeable_mask, universe_report = build_tradeable_mask(
         score_df,
         price_df=price_df,
@@ -539,23 +559,28 @@ def run_quick_backtest(
         excluded_prefixes=excluded_prefixes,
     )
 
+    # ── 分层回测 ─────────────────────────────────────────────────────
     ret_df, group_diag = quantile_backtest(
         score_df, label_df, n_groups,
         start_date=start_date, end_date=end_date,
         tradeable_mask=tradeable_mask,
         return_diagnostics=True,
     )
-    if top_ks:
-        top_df, top_diag = topk_equal_weight_returns(
-            score_df, label_df, ks=top_ks,
+
+    # ── TopN / TailN ─────────────────────────────────────────────────
+    topN_df = pd.DataFrame()
+    top_diag = pd.DataFrame()
+    if top_ks or tail_ks:
+        topN_df, top_diag = topk_equal_weight_returns(
+            score_df, label_df,
+            ks=top_ks,
+            tail_ks=tail_ks,
             start_date=start_date, end_date=end_date,
             tradeable_mask=tradeable_mask,
             return_diagnostics=True,
         )
-        ret_df = ret_df.join(top_df.reindex(ret_df.index), how="left")
-    else:
-        top_diag = pd.DataFrame()
 
+    # ── 股票池报告 ───────────────────────────────────────────────────
     report_dates = universe_report.index
     if start_date is not None:
         report_dates = report_dates[report_dates >= pd.Timestamp(start_date)]
@@ -566,11 +591,10 @@ def run_quick_backtest(
     if not top_diag.empty:
         report = report.join(top_diag, how="left")
 
-    logger.info("分层回测完成: %d 交易日, %d 组%s",
-                len(ret_df), n_groups,
-                f", topK={top_ks}" if top_ks else "")
+    logger.info("分层回测完成: %d 交易日, %d 组, topK=%s, tailK=%s",
+                len(ret_df), n_groups, top_ks, tail_ks)
     logger.info(
-        "quick 股票池报告: 平均 score=%d, 可交易=%d, 无TWAP=%d, 涨停无法买入=%d, 新股=%d, 退市缓冲=%d, ST=%d, 前缀剔除=%d, group缺label=%d",
+        "stock pool: score=%d tradeable=%d no_twap=%d limit_up=%d new=%d delist=%d st=%d prefix=%d",
         int(report["score_nonnull"].mean()) if not report.empty else 0,
         int(report["tradeable"].mean()) if not report.empty else 0,
         int(report["excluded_no_twap_price"].mean()) if not report.empty else 0,
@@ -579,20 +603,40 @@ def run_quick_backtest(
         int(report["excluded_pre_delist"].mean()) if not report.empty else 0,
         int(report["excluded_st"].mean()) if not report.empty else 0,
         int(report["excluded_prefix"].mean()) if not report.empty else 0,
-        int(report["group_label_missing"].mean()) if "group_label_missing" in report else 0,
     )
+    for col in list(ret_df.columns) + list(topN_df.columns if not topN_df.empty else []):
+        src = ret_df if col in ret_df.columns else topN_df
+        perf = calc_performance(src[col].dropna())
+        logger.info("  %s: Ann=%.2f%% MDD=%.2f%% SR=%.2f WR=%.2f%%",
+                    col, perf["ann_ret"] * 100, perf["max_drawdown"] * 100, perf["sharpe"],
+                    perf["win_rate"] * 100)
 
-    for col in ret_df.columns:
-        perf = calc_performance(ret_df[col].dropna())
-        logger.info("  %s: Ann=%.2f%% MDD=%.2f%% SR=%.2f",
-                     col, perf["ann_ret"] * 100, perf["max_drawdown"] * 100, perf["sharpe"])
-
-    if save_path is None:
-        save_path = config.BT_RESULT_DIR / "quantile_backtest.png"
-    report_path = Path(save_path).with_name("quick_backtest_universe_report.csv")
-    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path = save_path.with_name("quick_backtest_universe_report.csv")
     report.to_csv(report_path)
-    logger.info("quick 股票池/缺失报告已保存: %s", report_path)
+    logger.info("股票池报告已保存: %s", report_path)
 
-    plot_quantile_nav(ret_df, title=title, save_path=save_path)
+    # ── 图1: 分层 NAV ────────────────────────────────────────────────
+    plot_quantile_nav(ret_df, title=f"{title} | Quantile Groups", save_path=save_path)
+
+    # ── 图2: TopN / TailN NAV ────────────────────────────────────────
+    if not topN_df.empty:
+        topN_save = save_path.with_name("topN_tailN_nav.png")
+        plot_quantile_nav(
+            topN_df,
+            title=f"{title} | TopN vs TailN",
+            save_path=topN_save,
+        )
+
+    # ── IC / Rank IC 分析 ────────────────────────────────────────────
+    if run_ic:
+        logger.info("开始 IC / Rank IC 分析 ...")
+        run_ic_analysis(
+            score_df=score_df,
+            label_df=label_df,
+            tradeable_mask=tradeable_mask,
+            title=f"{title} | IC / Rank IC",
+            output_dir=save_path.parent,
+            rolling_window=ic_rolling_window,
+        )
+
     return ret_df

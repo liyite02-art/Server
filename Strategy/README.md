@@ -54,7 +54,8 @@ Strategy/
 ├── backtest/
 │   ├── universe.py                # 股票池过滤（新股/退市/ST/前缀）
 │   ├── quick_backtest.py          # 快速分层/TopK 回测
-│   └── event_backtest.py          # 精细事件驱动回测引擎
+│   ├── event_backtest.py          # 精细事件驱动回测引擎
+│   └── ic_analysis.py             # IC / Rank IC 分析（与打分质量评估）
 │
 ├── utils/
 │   └── helpers.py                 # 代码转换、交易日历、safe_rolling
@@ -406,6 +407,56 @@ oos:    [OOS_START,   +∞)
 
 > **与 `event_backtest` 的差异**：分层回测每日更换持仓，无整手约束，无执行延迟。精细回测包含费率、整手、调仓频率、涨跌停成交判断。两者结果有差距属正常现象。
 
+#### `ic_analysis.py` — IC / Rank IC 分析
+
+评估模型打分（Score）与下期实际收益（Label）之间的截面预测能力。
+
+**两种相关性指标**：
+
+| 指标 | 计算方式 | 含义 |
+|------|----------|------|
+| IC (Information Coefficient) | 皮尔逊线性相关 | 衡量打分与收益的线性相关程度 |
+| Rank IC | 斯皮尔曼秩相关 | 对异常值更鲁棒，更贴近实际选股排序能力 |
+
+**`run_ic_analysis(score_df, label_df, ...)`**
+
+一键运行入口，与 `run_quick_backtest` 共享相同 `tradeable_mask`（无重复计算）：
+
+```python
+from Strategy.backtest.ic_analysis import run_ic_analysis
+
+ic_df, summary = run_ic_analysis(
+    score_df=score_df,
+    label_df=label_df,
+    tradeable_mask=tradeable_mask,   # 与 quick_backtest 共用
+    title="XGB | TWAP_1430_1457",
+    rolling_window=20,               # IC 滚动均线窗口
+)
+```
+
+分段统计（`ic_summary.csv`）字段说明：
+
+| 字段 | 说明 |
+|------|------|
+| `mean` | IC / Rank IC 均值 |
+| `std` | IC / Rank IC 标准差 |
+| `icir` | ICIR = mean / std，衡量 IC 稳定性 |
+| `win_rate` | IC > 0 的天数占比（胜率） |
+| `t_stat` / `p_value` | 均值是否显著异于 0 的 t 检验 |
+| `n_days` | 有效交易日数 |
+
+**与 `run_quick_backtest` 集成**：
+
+`run_quick_backtest` 默认 `run_ic=True`，在分层回测结束后自动调用 IC 分析：
+
+```python
+run_quick_backtest(
+    score_df, label_df,
+    run_ic=True,           # 默认开启，传 False 可跳过
+    ic_rolling_window=20,  # IC 滚动均线窗口
+)
+```
+
 #### `event_backtest.py` — 精细事件驱动回测
 
 模拟真实交易执行的完整回测引擎。
@@ -598,6 +649,9 @@ outputs/
     ├── quantile_backtest.png            # 20组分层 NAV 曲线
     ├── topN_nav.png                     # Top20/50/100 NAV 曲线对比
     ├── quick_backtest_universe_report.csv
+    ├── ic_series.csv                    # 每日 IC / Rank IC 时间序列
+    ├── ic_summary.csv                   # Train/Val/OOS 分段 ICIR 统计
+    ├── ic_analysis.png                  # IC 时序 + 累积曲线 + ICIR 柱图
     ├── {strategy}_event_nav.csv         # 精细回测每日净值
     ├── {strategy}_trades_all.csv        # 全量交易流水
     ├── {strategy}_exceptions.csv        # 异常记录
