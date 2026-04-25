@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 from Strategy import config
 from Strategy.data_io.loader import MinuteDataLoader
 from Strategy.data_io.saver import save_wide_table
-from Strategy.utils.helpers import get_minute_files, date_to_int, ensure_tradedate_as_index
+from Strategy.utils.helpers import get_minute_files, date_to_int
 
 logger = logging.getLogger(__name__)
 
@@ -109,15 +109,75 @@ class LabelGenerator:
         logger.info("基准价格表计算完成: shape=%s", price_df.shape)
         return price_df
 
-    # ─── 计算 Label (未来收益率) ────────────────────────────────────
+    # ─── 计算 Label (未来收益率, 含除息除权调整) ───────────────────
     def compute_label(self, price_df: pd.DataFrame) -> pd.DataFrame:
         """
-        label(T) = price(T+1) / price(T) - 1
+        计算除息除权调整后的未来收益率。
+
+        公式:
+            adj_label(T) = TWAP(T+1) / TWAP(T) * CLOSE(T) / PRE_CLOSE(T+1) - 1
+
+        其中:
+          - TWAP(T+1) / TWAP(T)      : 原始 TWAP 收益率 (未复权, 除权日会虚假下跌)
+          - CLOSE(T) / PRE_CLOSE(T+1): 除权因子:
+              PRE_CLOSE 是 T+1 日早上公布的参考价 (已考虑隔夜分红送股),
+              CLOSE 是 T 日实际收盘价 (未考虑次日分股);
+              普通交易日 CLOSE ≈ PRE_CLOSE, 因子 ≈ 1; 分股日因子放大,
+              从而消除 TWAP 收益率中的虚假下跌。
 
         ⚠️ 这是"未来收益率", 仅作为训练目标!
         使用 shift(-1) 取次日价格, 最后一行为 NaN。
+        若 Daily_data 中缺少复权价格文件, 则回退到未复权公式并输出警告。
         """
-        label = price_df.shift(-1) / price_df - 1
+        close_path     = config.DAILY_DATA_DIR / "CLOSE_PRICE.pkl"
+        pre_close_path = config.DAILY_DATA_DIR / "PRE_CLOSE_PRICE.pkl"
+
+        if close_path.exists() and pre_close_path.exists():
+            try:
+                close_df = pd.read_pickle(close_path)
+                close_df.index = pd.DatetimeIndex(close_df.index)
+                close_df.columns = pd.Index([str(c).zfill(6) for c in close_df.columns])
+
+                pre_close_df = pd.read_pickle(pre_close_path)
+                pre_close_df.index = pd.DatetimeIndex(pre_close_df.index)
+                pre_close_df.columns = pd.Index([str(c).zfill(6) for c in pre_close_df.columns])
+
+                # 对齐到 price_df 的日期和股票列
+                common_stocks = (
+                    price_df.columns
+                    .intersection(close_df.columns)
+                    .intersection(pre_close_df.columns)
+                )
+                close_aligned     = close_df.reindex(index=price_df.index, columns=common_stocks)
+                pre_close_aligned = pre_close_df.reindex(index=price_df.index, columns=common_stocks)
+
+                # adj_factor(T) = CLOSE(T) / PRE_CLOSE(T+1)
+                # PRE_CLOSE(T+1) → shift(-1) 将 T+1 行的数据对齐到 T 的索引
+                adj_factor = close_aligned / pre_close_aligned.shift(-1)
+                # price_df 中有而 close/pre_close 无的股票, 用 1.0 填充 (不调整)
+                adj_factor = adj_factor.reindex(columns=price_df.columns).fillna(1.0)
+
+                # adj_label(T) = (TWAP(T+1) / TWAP(T)) * adj_factor(T) - 1
+                raw_return = price_df.shift(-1) / price_df
+                label = raw_return.multiply(adj_factor) - 1
+                logger.info(
+                    "除权调整已应用 (CLOSE / PRE_CLOSE): 共 %d 支股票参与调整",
+                    len(common_stocks),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "除权调整失败 (%s), 回退到未复权公式: %s", exc.__class__.__name__, exc
+                )
+                label = price_df.shift(-1) / price_df - 1
+        else:
+            missing = [p.name for p in (close_path, pre_close_path) if not p.exists()]
+            logger.warning(
+                "缺少文件 %s, 无法进行除权调整, 使用未复权 Label。"
+                "建议确认 Daily_data 中存在 CLOSE_PRICE.pkl 和 PRE_CLOSE_PRICE.pkl",
+                missing,
+            )
+            label = price_df.shift(-1) / price_df - 1
+
         label.index.name = "TRADE_DATE"
         return label
 
@@ -152,11 +212,13 @@ def load_label(tag: str = "TWAP_1430_1457") -> pd.DataFrame:
     """快捷加载已保存的 Label 宽表"""
     path = config.LABEL_OUTPUT_DIR / f"LABEL_{tag}.fea"
     df = pd.read_feather(path)
-    return ensure_tradedate_as_index(df)
+    df = df.set_index("TRADE_DATE")
+    return df
 
 
 def load_price(tag: str = "TWAP_1430_1457") -> pd.DataFrame:
     """快捷加载已保存的基准价格宽表"""
     path = config.LABEL_OUTPUT_DIR / f"{tag}.fea"
     df = pd.read_feather(path)
-    return ensure_tradedate_as_index(df)
+    df = df.set_index("TRADE_DATE")
+    return df

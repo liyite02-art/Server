@@ -19,6 +19,36 @@ from Strategy.model.trainer import XGBTrainer, build_panel
 logger = logging.getLogger(__name__)
 
 
+def _load_current_price_mask(label_tag: str, index: pd.Index, columns: pd.Index) -> Optional[pd.DataFrame]:
+    """T 日当前可交易价格 mask; 不使用未来 label 非空性。"""
+    price_path = config.LABEL_OUTPUT_DIR / f"{label_tag}.fea"
+    if not price_path.exists():
+        logger.warning("价格表不存在, 无法按 T 日价格 mask score: %s", price_path)
+        return None
+    price_df = pd.read_feather(price_path).set_index("TRADE_DATE")
+    price_df.index = pd.DatetimeIndex(price_df.index)
+    price_df.columns = pd.Index([str(c).zfill(6) for c in price_df.columns])
+    return price_df.reindex(index=pd.DatetimeIndex(index), columns=columns).notna()
+
+
+def mask_scores_by_current_price(
+    score_wide: pd.DataFrame,
+    label_tag: str = "TWAP_1430_1457",
+) -> pd.DataFrame:
+    """剔除 T 日没有执行价格的股票, 避免退市/停牌股票进入后续回测候选。"""
+    out = score_wide.copy()
+    out.index = pd.DatetimeIndex(out.index)
+    out.columns = pd.Index([str(c).zfill(6) for c in out.columns])
+    mask = _load_current_price_mask(label_tag, out.index, out.columns)
+    if mask is None:
+        return out
+    before = int(out.notna().sum().sum())
+    out = out.where(mask)
+    after = int(out.notna().sum().sum())
+    logger.info("score 已按 T 日价格 mask: before=%d after=%d removed=%d", before, after, before - after)
+    return out
+
+
 def score_all(
     trainer: XGBTrainer,
     panel: pd.DataFrame,
@@ -92,6 +122,7 @@ def generate_scores(
 
     panel = build_panel(factor_dict, label_df)
     score_wide = score_all(trainer, panel, normalize=normalize)
+    score_wide = mask_scores_by_current_price(score_wide, label_tag=label_tag)
 
     fname = f"SCORE_{model_name}_{label_tag}.fea"
     path = save_wide_table(score_wide, out / fname)
@@ -110,4 +141,5 @@ def load_scores(
         raise FileNotFoundError(f"打分文件不存在: {path}")
     df = pd.read_feather(path)
     df = df.set_index("TRADE_DATE")
+    df = mask_scores_by_current_price(df, label_tag=label_tag)
     return df
