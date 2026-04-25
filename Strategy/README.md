@@ -142,7 +142,7 @@ Cell 9  → 早盘 09:35 买 / 次日 10:00 卖回测（open0935_1000）
 | `LABEL_OUTPUT_DIR` | Label 落盘目录（`outputs/labels/`） |
 | `SCORE_OUTPUT_DIR` | 打分落盘目录（`outputs/scores/`） |
 | `BT_RESULT_DIR` | 回测结果目录（`outputs/bt_results/`） |
-| `COMMISSION_RATE` | 双向佣金（默认万二） |
+| `COMMISSION_RATE` | 双向佣金（默认万一） |
 | `STAMP_DUTY_RATE` | 卖出印花税（默认万五） |
 | `INITIAL_CAPITAL` | 初始资金（默认 1,000 万） |
 
