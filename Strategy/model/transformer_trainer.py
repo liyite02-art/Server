@@ -33,6 +33,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 
 from Strategy import config
 
@@ -42,11 +44,13 @@ logger = logging.getLogger(__name__)
 # WPCC 损失函数
 # ═══════════════════════════════════════════════════════════════════════
 
-def wpcc_loss_fn(y_pred, y_true, mask, weights=None, eps=1e-8):
+def wpcc_loss_fn(y_pred, y_true, mask, weights=None, eps=1e-5):
     """
     加权皮尔逊相关系数损失 (Weighted Pearson Correlation Coefficient).
 
     Loss = -WPCC(y_pred, y_true)，使模型直接优化截面 IC。
+
+    WPCC 在 float32 中计算 (AMP 下 y_pred 常为 float16, 方差/相关易数值爆炸或 NaN)。
 
     Parameters
     ----------
@@ -67,6 +71,12 @@ def wpcc_loss_fn(y_pred, y_true, mask, weights=None, eps=1e-8):
         -mean(WPCC across batch)
     """
     import torch
+
+    # AMP 下用 fp32 做相关，避免全 NaN 的 train/val loss
+    y_pred = y_pred.float()
+    y_true = y_true.float()
+    if weights is not None:
+        weights = weights.float()
 
     # 每个日期独立计算 WPCC，取批次均值
     batch_size = y_pred.shape[0]
@@ -100,90 +110,86 @@ def wpcc_loss_fn(y_pred, y_true, mask, weights=None, eps=1e-8):
 
         denom = torch.sqrt(var_p * var_t + eps)
         corr  = cov / denom
-        corrs.append(corr)
+        if torch.isfinite(corr).item():
+            corrs.append(corr)
 
     if len(corrs) == 0:
-        return y_pred.sum() * 0.0         # 无有效截面，返回 0 梯度
+        # 无有效截面: 旧版 y_pred.sum() * 0 在 y_pred 为 nan 时得到 nan*0=nan
+        return y_pred.nansum() * 0.0
 
-    return -torch.stack(corrs).mean()     # 最大化相关 = 最小化负相关
+    return -torch.stack(corrs).mean()  # 最大化相关 = 最小化负相关
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # 截面 Transformer 网络
 # ═══════════════════════════════════════════════════════════════════════
 
-class CrossSectionalTransformer:
+class CrossSectionalTransformerModel(nn.Module):
     """
     截面 Transformer: 股票 = token, 因子 = token 特征。
 
-    Architecture:
-        Input (N_stocks × D_features)
-          → Linear(D_features, d_model)
-          → LayerNorm
-          → L × TransformerEncoderLayer(d_model, nhead, d_ff, dropout)
-          → Linear(d_model, 1)
-        Output (N_stocks × 1)
+    需为 **模块级类** 以便 ``pickle`` / ``RollingTrainer.save_model`` 可序列化
+    (不能为 ``build`` 内嵌的局部类)。
+    """
 
-    注意: 不使用位置编码, 因为截面中股票没有固有顺序。
+    def __init__(
+        self,
+        d_input: int,
+        d_model: int = 64,
+        nhead: int = 4,
+        num_layers: int = 2,
+        d_ff: int = 128,
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+        self.input_proj = nn.Sequential(
+            nn.Linear(d_input, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            enc_layer,
+            num_layers=num_layers,
+            enable_nested_tensor=False,
+        )
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        h = self.input_proj(x)
+        h = self.encoder(h, src_key_padding_mask=src_key_padding_mask)
+        return self.head(h).squeeze(-1)
+
+
+class CrossSectionalTransformer:
+    """
+    工厂: 构建 `CrossSectionalTransformerModel`。
     """
 
     @staticmethod
     def build(d_input: int, d_model: int = 64, nhead: int = 4,
-              num_layers: int = 2, d_ff: int = 128, dropout: float = 0.15):
-        """构建模型, 延迟 import torch 以便本地无 GPU 也能导入本模块。"""
-        import torch
-        import torch.nn as nn
-
-        class _Model(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.input_proj = nn.Sequential(
-                    nn.Linear(d_input, d_model),
-                    nn.LayerNorm(d_model),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                )
-                encoder_layer = nn.TransformerEncoderLayer(
-                    d_model=d_model,
-                    nhead=nhead,
-                    dim_feedforward=d_ff,
-                    dropout=dropout,
-                    activation="gelu",
-                    batch_first=True,
-                    norm_first=True,          # Pre-LN 更稳定
-                )
-                self.encoder = nn.TransformerEncoder(
-                    encoder_layer,
-                    num_layers=num_layers,
-                    enable_nested_tensor=False,  # norm_first=True 时避免无意义 warning
-                )
-                self.head = nn.Sequential(
-                    nn.Linear(d_model, d_model // 2),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(d_model // 2, 1),
-                )
-
-            def forward(self, x, src_key_padding_mask=None):
-                """
-                Parameters
-                ----------
-                x : Tensor, (batch, seq_len, d_input)
-                src_key_padding_mask : BoolTensor, (batch, seq_len)
-                    True = padding 位置 (被忽略)
-
-                Returns
-                -------
-                Tensor, (batch, seq_len)
-                """
-                h = self.input_proj(x)                # (B, N, d_model)
-                h = self.encoder(h, src_key_padding_mask=src_key_padding_mask)
-                out = self.head(h).squeeze(-1)        # (B, N)
-                return out
-
-        model = _Model()
-
-        # 参数量统计
+              num_layers: int = 2, d_ff: int = 128, dropout: float = 0.15) -> CrossSectionalTransformerModel:
+        model = CrossSectionalTransformerModel(
+            d_input, d_model, nhead, num_layers, d_ff, dropout,
+        )
         n_params = sum(p.numel() for p in model.parameters())
         logger.info(
             "CrossSectionalTransformer: d_input=%d, d_model=%d, nhead=%d, "
@@ -290,6 +296,10 @@ class TransformerTrainer:
         验证集无改善的容忍轮数, 默认 8
     device : str
         训练设备, 默认 "cuda" (自动回退到 "cpu")
+    use_amp : bool
+        是否启用 CUDA 混合精度; 默认关闭 (全 float32 训练)
+    label_winsorize_sigma : float
+        截面 Label Winsorize 倍数, ``<=0`` 表示关闭 (与 ``Strategy.model.trainer._winsorize_label_cross_section`` 一致)
     """
 
     def __init__(
@@ -305,7 +315,7 @@ class TransformerTrainer:
         batch_size: int = 16,
         early_stopping_patience: int = 8,
         device: str = "cuda",
-        use_amp: bool = True,
+        use_amp: bool = False,
         label_winsorize_sigma: float = 3.0,
     ):
         self.d_model = d_model
@@ -408,7 +418,8 @@ class TransformerTrainer:
                 optimizer.zero_grad()
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
                     pred = self.model(X, src_key_padding_mask=pad_mask)
-                    loss = wpcc_loss_fn(pred, y, valid_mask)
+                # WPCC 在 loss 内转 fp32；与 autocast 分离开更稳定
+                loss = wpcc_loss_fn(pred, y, valid_mask)
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -435,7 +446,7 @@ class TransformerTrainer:
                         X, y, pad_mask, valid_mask = _collate_daily_batch(batch, device)
                         with torch.amp.autocast("cuda", enabled=amp_enabled):
                             pred = self.model(X, src_key_padding_mask=pad_mask)
-                            loss = wpcc_loss_fn(pred, y, valid_mask)
+                        loss = wpcc_loss_fn(pred, y, valid_mask)
                         val_losses.append(loss.item())
                 avg_val = np.mean(val_losses) if val_losses else float("nan")
 

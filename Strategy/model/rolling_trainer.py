@@ -20,11 +20,12 @@ Fold 示例 (val_months=3):
 """
 from __future__ import annotations
 
+import io
 import logging
 import pickle
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import pandas as pd
@@ -33,6 +34,73 @@ from dateutil.relativedelta import relativedelta
 from Strategy import config
 
 logger = logging.getLogger(__name__)
+
+# rolling_model.pkl 中每个 fold 的模型序列化格式
+_ROLL_MDL_V2 = 2
+_ROLL_KEY_TRANSFORMER = "transformer_torch"  # torch.save 的 bytes, 非 pickle 整对象
+
+
+def _pack_rolling_fold_model(model: Any, model_class: Type) -> Any:
+    """
+    RollingTrainer 内单折模型落盘: Transformer 只存 state_dict, 避免 pickle 局部类/不可序列化对象。
+    其它模型仍用 pickle 整对象。
+    """
+    if model_class.__name__ == "TransformerTrainer" and getattr(model, "model", None) is not None:
+        import torch
+
+        buf = io.BytesIO()
+        torch.save(
+            {
+                "state_dict": model.model.state_dict(),
+                "feature_names": model.feature_names,
+                "hparams": model._hparams,
+            },
+            buf,
+        )
+        return {
+            "v": _ROLL_MDL_V2,
+            "kind": _ROLL_KEY_TRANSFORMER,
+            "b": buf.getvalue(),
+        }
+    return {
+        "v": _ROLL_MDL_V2,
+        "kind": "pickle",
+        "b": pickle.dumps(model),
+    }
+
+
+def _unpack_rolling_fold_model(
+    packed: Union[None, bytes, Dict[str, Any]],
+    model_class: Type,
+) -> Any:
+    """与 _pack_rolling_fold_model 对称; 兼容旧版「整段 bytes = pickle」."""
+    if packed is None:
+        return None
+    if isinstance(packed, bytes):
+        return pickle.loads(packed)
+
+    if not isinstance(packed, dict) or packed.get("v") != _ROLL_MDL_V2:
+        raise ValueError("无法识别的 model_states 格式")
+
+    kind = packed.get("kind")
+    blob: bytes = packed["b"]
+    if kind == _ROLL_KEY_TRANSFORMER:
+        import torch
+        from Strategy.model.transformer_trainer import CrossSectionalTransformer
+
+        d = torch.load(io.BytesIO(blob), map_location="cpu", weights_only=False)
+        t = model_class()
+        t.feature_names = d["feature_names"]
+        t._hparams = d["hparams"]
+        t.model = CrossSectionalTransformer.build(**d["hparams"])
+        t.model.load_state_dict(d["state_dict"])
+        t.model.eval()
+        return t
+
+    if kind == "pickle":
+        return pickle.loads(blob)
+
+    raise ValueError(f"无法识别的 model kind: {kind!r}")
 
 
 @dataclass
@@ -358,11 +426,11 @@ class RollingTrainer:
         return summary
 
     def save_model(self, path: Optional[Path] = None) -> Path:
-        """保存所有 Fold 模型 + 元数据。"""
+        """保存所有 Fold 模型 + 元数据。``TransformerTrainer`` 按折只存 state_dict, 可正常 pickle 落盘。"""
         path = Path(path or (config.SCORE_OUTPUT_DIR / "rolling_model.pkl"))
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        save_data = {
+        save_data: Dict[str, Any] = {
             "folds": self.folds,
             "fold_metrics": self.fold_metrics,
             "feature_names": self.feature_names,
@@ -372,17 +440,15 @@ class RollingTrainer:
             "first_train_months": self.first_train_months,
             "val_months": self.val_months,
         }
-
-        # 各 Fold 模型单独保存
-        model_states = []
-        for i, model in enumerate(self.models):
-            if model is None:
+        model_states: List[Any] = []
+        for m in self.models:
+            if m is None:
                 model_states.append(None)
-                continue
-            # 通用方式: 序列化整个模型对象
-            model_states.append(pickle.dumps(model))
+            else:
+                model_states.append(
+                    _pack_rolling_fold_model(m, self.model_class),
+                )
         save_data["model_states"] = model_states
-
         with open(path, "wb") as f:
             pickle.dump(save_data, f)
         logger.info("滚动模型已保存: %s (%d folds)", path, len(self.folds))
@@ -403,10 +469,9 @@ class RollingTrainer:
 
         self.models = []
         for state in data["model_states"]:
-            if state is None:
-                self.models.append(None)
-            else:
-                self.models.append(pickle.loads(state))
+            self.models.append(
+                _unpack_rolling_fold_model(state, self.model_class),
+            )
 
         logger.info("滚动模型已加载: %s (%d folds)", path, len(self.folds))
         return self
