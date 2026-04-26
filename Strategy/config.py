@@ -6,8 +6,8 @@ from pathlib import Path
 import datetime as dt
 
 # ── 根目录 ──────────────────────────────────────────────────────────────
-PROJECT_ROOT = Path("D:/Quantitative_Investment/Strategy")
-DATA_ROOT = Path("D:/Quantitative_Investment")
+PROJECT_ROOT = Path("/root/autodl-tmp/Strategy")
+DATA_ROOT = Path("/root/autodl-tmp")
 
 # ── 原始数据路径 ────────────────────────────────────────────────────────
 MIN_DATA_DIR = DATA_ROOT / "min_data"          # 分钟频: {year}/{YYYYMMDD}.fea

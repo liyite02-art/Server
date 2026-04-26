@@ -76,7 +76,7 @@ def _winsorize_label_cross_section(
 
 
 def _make_wpcc_objective(date_ids: np.ndarray):
-    """
+    r"""
     为 XGBoost 生成 WPCC 自定义目标函数。
 
     数学:
@@ -135,6 +135,41 @@ def _make_wpcc_eval(date_ids: np.ndarray):
                 continue
             corrs.append(np.mean(d * e) / (s_yh * s_y))
         return "wpcc", float(-np.mean(corrs)) if corrs else 0.0  # 负值，XGB 最小化
+
+    return wpcc_eval
+
+
+def _make_wpcc_eval_train_val(dtrain, dval, train_date_ids: np.ndarray, val_date_ids: np.ndarray):
+    """
+    XGBoost 会对 evals 里每个 DMatrix 调用同一个 custom_metric；
+    必须用各自行的日期分组计算 WPCC，不能把 val 的 date_ids 套在 train 的 predt 上。
+    """
+    ts = {d: np.where(train_date_ids == d)[0] for d in np.unique(train_date_ids)}
+    vs = {d: np.where(val_date_ids == d)[0] for d in np.unique(val_date_ids)}
+
+    def _mean_wpcc(predt, labels, slices: dict) -> float:
+        corrs = []
+        for idx in slices.values():
+            if len(idx) < 10:
+                continue
+            yh = predt[idx]
+            y = labels[idx]
+            d = yh - yh.mean()
+            e = y - y.mean()
+            s_yh = np.sqrt(np.mean(d ** 2))
+            s_y = np.sqrt(np.mean(e ** 2))
+            if s_yh < 1e-10 or s_y < 1e-10:
+                continue
+            corrs.append(np.mean(d * e) / (s_yh * s_y))
+        return float(-np.mean(corrs)) if corrs else 0.0
+
+    def wpcc_eval(predt, dmat):
+        labels = dmat.get_label()
+        if dmat is dtrain:
+            return "wpcc", _mean_wpcc(predt, labels, ts)
+        if dval is not None and dmat is dval:
+            return "wpcc", _mean_wpcc(predt, labels, vs)
+        return "wpcc", 0.0
 
     return wpcc_eval
 
@@ -387,6 +422,7 @@ class XGBTrainer:
         dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=self.feature_names)
 
         evals = [(dtrain, "train")]
+        dval = None
         val_date_ids = None
         if val_df is not None:
             val_clean = val_df.dropna(subset=["label"])
@@ -400,7 +436,6 @@ class XGBTrainer:
             )
             dval = xgb.DMatrix(X_val, label=y_val, feature_names=self.feature_names)
             evals.append((dval, "val"))
-            # 验证集的日期分组 (用于 WPCC eval)
             val_date_ids = pd.factorize(
                 pd.to_datetime(val_clean["TRADE_DATE"]).values
             )[0]
@@ -411,14 +446,16 @@ class XGBTrainer:
         params = dict(self.params)
 
         if self.use_wpcc:
-            # 训练集日期分组
             train_date_ids = pd.factorize(
                 pd.to_datetime(train_clean["TRADE_DATE"]).values
             )[0]
             obj_fn = _make_wpcc_objective(train_date_ids)
-            # eval: 用验证集的日期分组 (若有验证集)
             if val_date_ids is not None:
-                custom_metric = _make_wpcc_eval(val_date_ids)
+                custom_metric = _make_wpcc_eval_train_val(
+                    dtrain, dval, train_date_ids, val_date_ids
+                )
+            else:
+                custom_metric = _make_wpcc_eval(train_date_ids)
             # 移除内置 objective/eval_metric，用自定义的
             params.pop("objective", None)
             params.pop("eval_metric", None)

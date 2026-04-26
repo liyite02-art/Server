@@ -155,6 +155,7 @@ class CrossSectionalTransformer:
                 self.encoder = nn.TransformerEncoder(
                     encoder_layer,
                     num_layers=num_layers,
+                    enable_nested_tensor=False,  # norm_first=True 时避免无意义 warning
                 )
                 self.head = nn.Sequential(
                     nn.Linear(d_model, d_model // 2),
@@ -398,6 +399,7 @@ class TransformerTrainer:
             self.model.train()
             np.random.shuffle(train_groups)
             train_losses = []
+            did_optimizer_step = False
 
             for batch_start in range(0, len(train_groups), self.batch_size):
                 batch = train_groups[batch_start : batch_start + self.batch_size]
@@ -411,11 +413,16 @@ class TransformerTrainer:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                if scaler.get_scale() >= scale_before:
+                    did_optimizer_step = True
                 train_losses.append(loss.item())
 
-            scheduler.step()
+            # 避免在任何 optimizer.step 之前调用 scheduler.step（PyTorch warning）
+            if did_optimizer_step:
+                scheduler.step()
             avg_train = np.mean(train_losses) if train_losses else float("nan")
 
             avg_val = float("nan")
