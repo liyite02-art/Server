@@ -1,21 +1,25 @@
 """
-滚动式训练编排器 (Expanding Window)
+滚动验证训练编排器 (Rolling Val CV)
 
-核心逻辑:
-  固定训练集起点, 每隔 val_months 月扩展一次训练集, 生成一个新 Fold。
-  每个 Fold 独立训练一个模型, 仅用于预测其验证窗口内的日期。
-  最终打分 = 拼接所有 Fold 的验证窗口预测 (严格无未来信息)。
+核心逻辑 (对应 strategy_rules.md §3-4):
+  将 IS Train Set 按时间块 (季度) 切割为 K 个 Fold。
+  每个 Fold: 取其中一个季度块作 Val (用于早停), 其余所有块拼接为 Train。
+  由于 batch=1 且截面间无序列依赖, Train 的时间段可位于 Val 之后, 无数据泄露。
 
-Fold 示例 (val_months=3):
-  Fold 1: Train=[2021-01, 2021-09]  Val=[2021-10, 2021-12]
-  Fold 2: Train=[2021-01, 2021-12]  Val=[2022-01, 2022-03]
-  Fold 3: Train=[2021-01, 2022-03]  Val=[2022-04, 2022-06]
-  ...
+  Fold 示例 (val_months=3, IS Train=2021-01~2023-09):
+    Fold 1:  Val=[2021-01, 2021-03]  Train=其余所有季度拼接
+    Fold 2:  Val=[2021-04, 2021-06]  Train=其余所有季度拼接
+    ...
+    Fold 11: Val=[2023-07, 2023-09]  Train=其余所有季度拼接
+
+IS Test Set 推理 (§4):
+  选取 Val 窗口结束时间最近的 ENSEMBLE_N_FOLDS 个 Fold,
+  各自独立推理后等权平均作为最终信号。
 
 使用:
   rt = RollingTrainer(XGBTrainer, model_kwargs={...})
-  rt.train_all_folds(panel)
-  score_wide = rt.score_all(panel)
+  rt.train_all_folds(is_train_panel)           # 在 IS Train 上训练所有 Fold
+  score_wide = rt.predict_is_test(is_test_panel)   # 4-Fold Ensemble 推理
   rt.save_model()
 """
 from __future__ import annotations
@@ -23,7 +27,7 @@ from __future__ import annotations
 import io
 import logging
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
@@ -35,19 +39,19 @@ from Strategy import config
 
 logger = logging.getLogger(__name__)
 
-# rolling_model.pkl 中每个 fold 的模型序列化格式
-_ROLL_MDL_V2 = 2
-_ROLL_KEY_TRANSFORMER = "transformer_torch"  # torch.save 的 bytes, 非 pickle 整对象
+_ROLL_MDL_V3 = 3                         # 本版序列化版本号
+_ROLL_KEY_TRANSFORMER = "transformer_torch"
+_ROLL_KEY_PICKLE = "pickle"
 
 
-def _pack_rolling_fold_model(model: Any, model_class: Type) -> Any:
-    """
-    RollingTrainer 内单折模型落盘: Transformer 只存 state_dict, 避免 pickle 局部类/不可序列化对象。
-    其它模型仍用 pickle 整对象。
-    """
+# ═══════════════════════════════════════════════════════════════════════
+# 序列化工具
+# ═══════════════════════════════════════════════════════════════════════
+
+def _pack_fold_model(model: Any, model_class: Type) -> Dict[str, Any]:
+    """单折模型序列化: Transformer 存 state_dict, 其余 pickle。"""
     if model_class.__name__ == "TransformerTrainer" and getattr(model, "model", None) is not None:
         import torch
-
         buf = io.BytesIO()
         torch.save(
             {
@@ -57,253 +61,216 @@ def _pack_rolling_fold_model(model: Any, model_class: Type) -> Any:
             },
             buf,
         )
-        return {
-            "v": _ROLL_MDL_V2,
-            "kind": _ROLL_KEY_TRANSFORMER,
-            "b": buf.getvalue(),
-        }
-    return {
-        "v": _ROLL_MDL_V2,
-        "kind": "pickle",
-        "b": pickle.dumps(model),
-    }
+        return {"v": _ROLL_MDL_V3, "kind": _ROLL_KEY_TRANSFORMER, "b": buf.getvalue()}
+    return {"v": _ROLL_MDL_V3, "kind": _ROLL_KEY_PICKLE, "b": pickle.dumps(model)}
 
 
-def _unpack_rolling_fold_model(
+def _unpack_fold_model(
     packed: Union[None, bytes, Dict[str, Any]],
     model_class: Type,
 ) -> Any:
-    """与 _pack_rolling_fold_model 对称; 兼容旧版「整段 bytes = pickle」."""
+    """与 _pack_fold_model 对称; 兼容旧版「整段 bytes = pickle」。"""
     if packed is None:
         return None
-    if isinstance(packed, bytes):
+    if isinstance(packed, bytes):          # 旧版兼容
         return pickle.loads(packed)
+    if not isinstance(packed, dict) or packed.get("v") not in (_ROLL_MDL_V3,):
+        raise ValueError(f"无法识别的 model_states 格式: {packed.get('v')!r}")
 
-    if not isinstance(packed, dict) or packed.get("v") != _ROLL_MDL_V2:
-        raise ValueError("无法识别的 model_states 格式")
-
-    kind = packed.get("kind")
+    kind = packed["kind"]
     blob: bytes = packed["b"]
+
     if kind == _ROLL_KEY_TRANSFORMER:
         import torch
-        from Strategy.model.transformer_trainer import CrossSectionalTransformer
-
+        from Strategy.model.transformer_trainer import CrossSectionalTransformerModel
         d = torch.load(io.BytesIO(blob), map_location="cpu", weights_only=False)
         t = model_class()
         t.feature_names = d["feature_names"]
         t._hparams = d["hparams"]
-        t.model = CrossSectionalTransformer.build(**d["hparams"])
+        # 重建网络结构
+        t.model = CrossSectionalTransformerModel(**{
+            k: d["hparams"][k]
+            for k in ("d_input", "d_model", "nhead", "num_layers", "d_ff", "dropout")
+        })
         t.model.load_state_dict(d["state_dict"])
         t.model.eval()
         return t
 
-    if kind == "pickle":
+    if kind == _ROLL_KEY_PICKLE:
         return pickle.loads(blob)
 
     raise ValueError(f"无法识别的 model kind: {kind!r}")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Fold 数据结构
+# ═══════════════════════════════════════════════════════════════════════
+
 @dataclass
 class FoldInfo:
+    """单个 Fold 的元数据。"""
     fold_id: int
-    train_start: pd.Timestamp
-    train_end: pd.Timestamp
     val_start: pd.Timestamp
     val_end: pd.Timestamp
+    # train 由 IS Train Set 中除 val 窗口外的所有日期构成 (运行时按 panel 过滤)
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# Fold 生成: 时间块切割 (Time-Block CV)
+# ═══════════════════════════════════════════════════════════════════════
 
 def generate_folds(
-    train_start: str = "2021-01-01",
-    data_end: Optional[str] = None,
-    first_train_months: int = 9,
-    val_months: int = config.ROLLING_VAL_MONTHS,
+    is_train_start: str = None,
+    is_train_end: str = None,
+    val_months: int = None,
 ) -> List[FoldInfo]:
     """
-    生成 Expanding Window Fold 列表。
+    将 IS Train Set 按时间块切割为多个 Fold。
+
+    每个 Fold 的 Val 窗口为一个时间块 (默认季度)；
+    Train = IS Train Set 中除该时间块外的所有日期 (运行时拼接)。
 
     Parameters
     ----------
-    train_start : str
-        训练集固定起点
-    data_end : str, optional
-        数据最后日期, None 时自动检测
-    first_train_months : int
-        第一个 Fold 的初始训练集月数, 默认 9
-    val_months : int
-        每个 Fold 的验证窗口月数, 默认 3
+    is_train_start : str, optional
+        IS 训练集起点，默认 config.IS_TRAIN_START
+    is_train_end : str, optional
+        IS 训练集终点，默认 config.IS_TRAIN_END
+    val_months : int, optional
+        每个 Val 块的月数，默认 config.ROLLING_VAL_MONTHS (3=季度)
+
+    Returns
+    -------
+    List[FoldInfo]
+        按 val_end 升序排列 (fold_id 从 1 开始)
     """
-    ts = pd.Timestamp(train_start)
-    folds = []
+    ts_start = pd.Timestamp(is_train_start or config.IS_TRAIN_START)
+    ts_end   = pd.Timestamp(is_train_end   or config.IS_TRAIN_END)
+    vm = val_months or config.ROLLING_VAL_MONTHS
+
+    folds: List[FoldInfo] = []
     fold_id = 1
-    train_end = ts + relativedelta(months=first_train_months) - pd.Timedelta(days=1)
+    cur = ts_start
 
-    while True:
-        val_start = train_end + pd.Timedelta(days=1)
-        val_end   = val_start + relativedelta(months=val_months) - pd.Timedelta(days=1)
-
-        if data_end is not None and val_start > pd.Timestamp(data_end):
-            break
+    while cur <= ts_end:
+        val_start = cur
+        val_end   = cur + relativedelta(months=vm) - pd.Timedelta(days=1)
+        # 最后一块不超出 IS Train 边界
+        val_end   = min(val_end, ts_end)
 
         folds.append(FoldInfo(
             fold_id=fold_id,
-            train_start=ts,
-            train_end=train_end,
             val_start=val_start,
             val_end=val_end,
         ))
 
-        train_end = val_end
+        cur = val_end + pd.Timedelta(days=1)
         fold_id += 1
-
-        if fold_id > 100:  # 安全上限
+        if fold_id > 200:
             break
 
+    logger.info(
+        "generate_folds: IS Train=[%s, %s], val_months=%d → %d Fold",
+        ts_start.date(), ts_end.date(), vm, len(folds),
+    )
+    for f in folds:
+        logger.debug(
+            "  Fold %d: Val=[%s, %s]",
+            f.fold_id, f.val_start.date(), f.val_end.date(),
+        )
     return folds
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# RollingTrainer
+# ═══════════════════════════════════════════════════════════════════════
+
 class RollingTrainer:
     """
-    滚动式训练编排器, 支持任意模型类 (XGBTrainer / TransformerTrainer)。
+    Rolling Val CV 训练编排器, 支持任意模型类 (XGBTrainer / TransformerTrainer)。
+
+    训练逻辑 (strategy_rules.md §3):
+      对 IS Train Set 内部做时间块切割 CV:
+        - Val 窗口 = 一个季度块, 用于早停 (early stopping)
+        - Train = IS Train Set 中其余所有日期拼接
+
+    IS Test 推理逻辑 (strategy_rules.md §4):
+      predict_is_test(is_test_panel):
+        → 选取 Val 窗口结束时间最近的 ENSEMBLE_N_FOLDS 个 Fold
+        → 各 Fold 模型独立推理, 等权平均
 
     Parameters
     ----------
-    model_class : type
+    model_class : Type
         模型类, 需实现 train(train_df, val_df) / predict(df) / save_model / load_model
     model_kwargs : dict
         传给模型构造函数的参数
-    train_start : str
-        训练集固定起点
-    first_train_months : int
-        第一个 Fold 初始训练集月数
+    is_train_start : str
+        IS 训练集起点
+    is_train_end : str
+        IS 训练集终点
     val_months : int
-        每个 Fold 验证窗口月数
+        Val 块月数 (季度=3)
+    n_ensemble : int
+        IS Test 推理时选取的最近 Fold 数
     """
 
     def __init__(
         self,
         model_class: Type,
         model_kwargs: Optional[dict] = None,
-        train_start: str = "2021-01-01",
-        first_train_months: int = 9,
-        val_months: int = config.ROLLING_VAL_MONTHS,
+        is_train_start: str = None,
+        is_train_end: str = None,
+        val_months: int = None,
+        n_ensemble: int = None,
     ):
-        self.model_class = model_class
+        self.model_class  = model_class
         self.model_kwargs = model_kwargs or {}
-        self.train_start = train_start
-        self.first_train_months = first_train_months
-        self.val_months = val_months
+        self.is_train_start = is_train_start or str(config.IS_TRAIN_START)
+        self.is_train_end   = is_train_end   or str(config.IS_TRAIN_END)
+        self.val_months     = val_months or config.ROLLING_VAL_MONTHS
+        self.n_ensemble     = n_ensemble or config.ENSEMBLE_N_FOLDS
 
         self.folds: List[FoldInfo] = []
-        self.models: List[Any] = []         # 每个 Fold 一个模型
-        self.fold_metrics: List[dict] = []  # 每个 Fold 的 IC 等指标
+        self.models: List[Any] = []
+        self.fold_metrics: List[dict] = []
         self.feature_names: List[str] = []
 
-    def _get_feature_cols(self, df: pd.DataFrame) -> List[str]:
+    # ── 工具 ────────────────────────────────────────────────────────
+    @staticmethod
+    def _get_feature_cols(df: pd.DataFrame) -> List[str]:
         exclude = {"TRADE_DATE", "StockID", "label"}
         return [c for c in df.columns if c not in exclude]
 
-    def train_all_folds(self, panel: pd.DataFrame) -> "RollingTrainer":
-        """
-        在 Panel 上训练所有 Fold。
-
-        Parameters
-        ----------
-        panel : pd.DataFrame
-            完整 Panel 长表 (含 TRADE_DATE, StockID, label, 因子列)
-        """
-        dates = pd.to_datetime(panel["TRADE_DATE"])
-        data_end = dates.max().strftime("%Y-%m-%d")
-
-        self.folds = generate_folds(
-            train_start=self.train_start,
-            data_end=data_end,
-            first_train_months=self.first_train_months,
-            val_months=self.val_months,
-        )
-
-        self.feature_names = self._get_feature_cols(panel)
-        logger.info("滚动训练: %d 个 Fold, 特征数=%d", len(self.folds), len(self.feature_names))
-
-        self.models = []
-        self.fold_metrics = []
-
-        for fold in self.folds:
-            logger.info(
-                "━━ Fold %d: Train=[%s, %s] Val=[%s, %s] ━━",
-                fold.fold_id,
-                fold.train_start.strftime("%Y-%m-%d"),
-                fold.train_end.strftime("%Y-%m-%d"),
-                fold.val_start.strftime("%Y-%m-%d"),
-                fold.val_end.strftime("%Y-%m-%d"),
-            )
-
-            train_mask = (dates >= fold.train_start) & (dates <= fold.train_end)
-            val_mask   = (dates >= fold.val_start)   & (dates <= fold.val_end)
-
-            train_df = panel.loc[train_mask].copy()
-            val_df   = panel.loc[val_mask].copy()
-
-            if len(train_df) == 0:
-                logger.warning("  Fold %d 训练集为空, 跳过", fold.fold_id)
-                self.models.append(None)
-                self.fold_metrics.append({"fold_id": fold.fold_id, "status": "skipped"})
-                continue
-            if len(val_df) == 0:
-                logger.warning("  Fold %d 验证集为空, 跳过", fold.fold_id)
-                self.models.append(None)
-                self.fold_metrics.append({"fold_id": fold.fold_id, "status": "skipped"})
-                continue
-
-            logger.info("  Train: %d rows, Val: %d rows", len(train_df), len(val_df))
-
-            # 训练
-            model = self.model_class(**self.model_kwargs)
-            model.train(train_df, val_df)
-            self.models.append(model)
-
-            # 计算 Fold 级 IC
-            metrics = self._compute_fold_ic(model, val_df, fold)
-            self.fold_metrics.append(metrics)
-
-        logger.info("滚动训练完成: %d 个 Fold", len(self.folds))
-        return self
-
-    def _compute_fold_ic(self, model, val_df: pd.DataFrame, fold: FoldInfo) -> dict:
-        """计算单个 Fold 在验证集上的 IC / Rank IC。"""
+    @staticmethod
+    def _compute_ic(preds: np.ndarray, val_df: pd.DataFrame, fold_id: int) -> dict:
+        """计算单个 Fold 在 Val 集上的 IC / Rank IC。"""
         from scipy import stats as sp_stats
-
-        try:
-            preds = model.predict(val_df)
-        except Exception as e:
-            logger.warning("  Fold %d predict 失败: %s", fold.fold_id, e)
-            return {"fold_id": fold.fold_id, "status": "predict_failed"}
-
-        val_df = val_df.copy()
-        val_df["pred"] = preds
-        val_dates = pd.to_datetime(val_df["TRADE_DATE"])
+        df = val_df.copy()
+        df["pred"] = preds
+        dates = pd.to_datetime(df["TRADE_DATE"])
 
         ics, rank_ics = [], []
-        for dt_val in val_dates.unique():
-            sub = val_df.loc[val_dates == dt_val].dropna(subset=["label", "pred"])
+        for dt_val in dates.unique():
+            sub = df.loc[dates == dt_val].dropna(subset=["label", "pred"])
             if len(sub) < 10:
                 continue
-            ic, _ = sp_stats.pearsonr(sub["pred"].values, sub["label"].values)
+            ic,  _ = sp_stats.pearsonr(sub["pred"].values, sub["label"].values)
             ric, _ = sp_stats.spearmanr(sub["pred"].values, sub["label"].values)
             ics.append(ic)
             rank_ics.append(ric)
 
-        mean_ic  = float(np.mean(ics))  if ics else float("nan")
+        mean_ic  = float(np.mean(ics))     if ics else float("nan")
         mean_ric = float(np.mean(rank_ics)) if rank_ics else float("nan")
-        ic_std   = float(np.std(ics))   if ics else float("nan")
+        ic_std   = float(np.std(ics))      if ics else float("nan")
         icir     = mean_ic / ic_std if ic_std > 1e-8 else float("nan")
 
         logger.info(
-            "  Fold %d Val IC: mean=%.4f  std=%.4f  ICIR=%.4f  RankIC=%.4f  days=%d",
-            fold.fold_id, mean_ic, ic_std, icir, mean_ric, len(ics),
+            "  Fold %d Val  IC=%.4f  ICIR=%.4f  RankIC=%.4f  days=%d",
+            fold_id, mean_ic, icir, mean_ric, len(ics),
         )
-
         return {
-            "fold_id": fold.fold_id,
+            "fold_id": fold_id,
             "status": "ok",
             "val_ic_mean": mean_ic,
             "val_ic_std": ic_std,
@@ -312,78 +279,205 @@ class RollingTrainer:
             "n_val_days": len(ics),
         }
 
-    def predict(self, df: pd.DataFrame) -> np.ndarray:
+    # ── 训练 ────────────────────────────────────────────────────────
+    def train_all_folds(self, is_train_panel: pd.DataFrame) -> "RollingTrainer":
         """
-        使用对应 Fold 的模型对每个日期进行预测。
+        在 IS Train Panel 上训练所有 Fold。
 
-        策略:
-        - 日期在某个 Fold 的验证窗口内 → 用该 Fold 模型
-        - 日期在第一个 Fold 训练期内 → 用第一个可用模型 (标注为样本内)
-        - 日期超出最后一个 Fold → 用最后一个模型
-        """
-        dates = pd.to_datetime(df["TRADE_DATE"])
-        unique_dates = sorted(dates.unique())
-
-        # 建立 date -> fold_index 映射
-        date_to_fold = {}
-        for i, fold in enumerate(self.folds):
-            for dt in unique_dates:
-                ts = pd.Timestamp(dt)
-                if fold.val_start <= ts <= fold.val_end:
-                    date_to_fold[dt] = i
-
-        # 未映射的日期: 训练期用 fold 0, 超出用最后一个
-        last_valid_fold = len(self.models) - 1
-        while last_valid_fold >= 0 and self.models[last_valid_fold] is None:
-            last_valid_fold -= 1
-        first_valid_fold = 0
-        while first_valid_fold < len(self.models) and self.models[first_valid_fold] is None:
-            first_valid_fold += 1
-
-        for dt in unique_dates:
-            if dt not in date_to_fold:
-                ts = pd.Timestamp(dt)
-                if len(self.folds) > 0 and ts < self.folds[0].val_start:
-                    date_to_fold[dt] = first_valid_fold
-                else:
-                    date_to_fold[dt] = last_valid_fold
-
-        # 按 fold 分批预测
-        all_preds = np.full(len(df), np.nan, dtype=np.float64)
-
-        fold_groups: Dict[int, List] = {}
-        for dt in unique_dates:
-            fi = date_to_fold.get(dt, last_valid_fold)
-            fold_groups.setdefault(fi, []).append(dt)
-
-        for fi, dt_list in fold_groups.items():
-            model = self.models[fi]
-            if model is None:
-                logger.warning("Fold %d 模型为空, 跳过 %d 天", fi, len(dt_list))
-                continue
-            mask = dates.isin(dt_list)
-            sub_df = df.loc[mask]
-            if len(sub_df) == 0:
-                continue
-            preds = model.predict(sub_df)
-            all_preds[mask.values] = preds
-
-        return all_preds
-
-    def score_all(self, panel: pd.DataFrame, normalize: bool = True) -> pd.DataFrame:
-        """
-        一键生成滚动模型打分宽表, 格式与 scorer.score_all() 完全一致。
+        对每个 Fold:
+          - val_df  = is_train_panel 中属于 Val 窗口的行
+          - train_df = is_train_panel 中属于其余所有时间块的行 (拼接)
+          - 用 val_df 做早停, 保存最佳权重
 
         Parameters
         ----------
-        panel : pd.DataFrame
-            Panel 长表
+        is_train_panel : pd.DataFrame
+            IS Train Set 的 Panel 长表 (含 TRADE_DATE / StockID / 因子列 / label)
+        """
+        self.folds = generate_folds(
+            is_train_start=self.is_train_start,
+            is_train_end=self.is_train_end,
+            val_months=self.val_months,
+        )
+        self.feature_names = self._get_feature_cols(is_train_panel)
+        dates = pd.to_datetime(is_train_panel["TRADE_DATE"])
+
+        logger.info(
+            "Rolling Val CV: %d Fold, 特征数=%d, IS Train=%s~%s",
+            len(self.folds), len(self.feature_names),
+            self.is_train_start, self.is_train_end,
+        )
+
+        self.models = []
+        self.fold_metrics = []
+
+        for fold in self.folds:
+            logger.info(
+                "━━ Fold %d/%d: Val=[%s, %s]  Train=IS Train-Val ━━",
+                fold.fold_id, len(self.folds),
+                fold.val_start.date(), fold.val_end.date(),
+            )
+
+            val_mask   = (dates >= fold.val_start) & (dates <= fold.val_end)
+            train_mask = ~val_mask   # IS Train 中除 Val 窗口外的所有行
+
+            val_df   = is_train_panel.loc[val_mask].copy()
+            train_df = is_train_panel.loc[train_mask].copy()
+
+            if len(train_df) == 0:
+                logger.warning("  Fold %d Train 集为空，跳过", fold.fold_id)
+                self.models.append(None)
+                self.fold_metrics.append({"fold_id": fold.fold_id, "status": "skipped_no_train"})
+                continue
+            if len(val_df) == 0:
+                logger.warning("  Fold %d Val 集为空，跳过", fold.fold_id)
+                self.models.append(None)
+                self.fold_metrics.append({"fold_id": fold.fold_id, "status": "skipped_no_val"})
+                continue
+
+            logger.info(
+                "  Train: %d 行 (%d 日) | Val: %d 行 (%d 日)",
+                len(train_df), dates[train_mask].nunique(),
+                len(val_df),   dates[val_mask].nunique(),
+            )
+
+            # 训练
+            model = self.model_class(**self.model_kwargs)
+            model.train(train_df, val_df)
+            self.models.append(model)
+
+            # Val IC 指标
+            try:
+                preds = model.predict(val_df)
+                metrics = self._compute_ic(preds, val_df, fold.fold_id)
+            except Exception as exc:
+                logger.warning("  Fold %d IC 计算失败: %s", fold.fold_id, exc)
+                metrics = {"fold_id": fold.fold_id, "status": "ic_failed"}
+            self.fold_metrics.append(metrics)
+
+        logger.info("Rolling Val CV 完成: %d Fold 已训练", sum(m is not None for m in self.models))
+        return self
+
+    # ── IS Test 推理 (4-Fold Ensemble) ──────────────────────────────
+    def _select_ensemble_folds(self) -> List[int]:
+        """
+        按 Val 窗口结束时间降序, 选取最近 n_ensemble 个有效 Fold 的索引。
+        """
+        valid_indices = [
+            i for i, m in enumerate(self.models) if m is not None
+        ]
+        if len(valid_indices) == 0:
+            raise RuntimeError("无可用 Fold 模型，请先调用 train_all_folds()")
+
+        # 按 val_end 降序排列 (最近的在前)
+        valid_indices_sorted = sorted(
+            valid_indices,
+            key=lambda i: self.folds[i].val_end,
+            reverse=True,
+        )
+        selected = valid_indices_sorted[: self.n_ensemble]
+        selected_fold_ids = [self.folds[i].fold_id for i in selected]
+        selected_val_ends = [self.folds[i].val_end.date() for i in selected]
+
+        logger.info(
+            "IS Test Ensemble: 选取最近 %d 个 Fold → Fold IDs=%s  Val Ends=%s",
+            len(selected), selected_fold_ids, selected_val_ends,
+        )
+        return selected
+
+    def predict_is_test(
+        self,
+        is_test_panel: pd.DataFrame,
+        normalize: bool = True,
+    ) -> pd.DataFrame:
+        """
+        对 IS Test Set 执行 4-Fold Ensemble 推理。
+
+        流程:
+          1. 按 val_end 降序选取最近 ENSEMBLE_N_FOLDS 个 Fold
+          2. 各 Fold 模型独立对 is_test_panel 推理
+          3. 等权平均作为最终预测信号
+          4. 可选截面 Z-Score 标准化
+
+        Parameters
+        ----------
+        is_test_panel : pd.DataFrame
+            IS Test Set 的 Panel 长表 (不含 label 也可; label 仅用于 IC 计算)
+        normalize : bool
+            是否对集成结果做截面 Z-Score 标准化
+
+        Returns
+        -------
+        pd.DataFrame
+            打分宽表 (index=TRADE_DATE, columns=StockID)
+        """
+        selected_indices = self._select_ensemble_folds()
+
+        all_preds = []
+        for i in selected_indices:
+            model = self.models[i]
+            preds = model.predict(is_test_panel)
+            all_preds.append(preds)
+            logger.info(
+                "  Fold %d 推理完成: mean=%.4f std=%.4f",
+                self.folds[i].fold_id, float(np.nanmean(preds)), float(np.nanstd(preds)),
+            )
+
+        # 等权平均
+        ensemble_preds = np.nanmean(np.stack(all_preds, axis=0), axis=0)
+
+        panel = is_test_panel.copy()
+        panel["score"] = ensemble_preds
+
+        if normalize:
+            panel["score"] = panel.groupby("TRADE_DATE")["score"].transform(
+                lambda x: (x - x.mean()) / (x.std() + 1e-8)
+            )
+
+        score_wide = panel.pivot(index="TRADE_DATE", columns="StockID", values="score")
+        score_wide.index.name = "TRADE_DATE"
+        logger.info(
+            "IS Test Ensemble 推理完成: %d dates × %d stocks",
+            *score_wide.shape,
+        )
+        return score_wide
+
+    # ── IS Train 截面打分 (每日用其所在 Fold 的模型) ────────────────
+    def score_is_train(
+        self,
+        is_train_panel: pd.DataFrame,
+        normalize: bool = True,
+    ) -> pd.DataFrame:
+        """
+        对 IS Train 数据生成 CV 内模型的打分 (每日使用对应 Val Fold 的模型)。
+
+        用途: 观察 IS Train 期间的模型行为, 不作为选模依据。
+
+        Parameters
+        ----------
+        is_train_panel : pd.DataFrame
+            IS Train Set 的 Panel 长表
         normalize : bool
             是否截面 Z-Score 标准化
+
+        Returns
+        -------
+        pd.DataFrame
+            打分宽表 (index=TRADE_DATE, columns=StockID)
         """
-        preds = self.predict(panel)
-        panel = panel.copy()
-        panel["score"] = preds
+        dates = pd.to_datetime(is_train_panel["TRADE_DATE"])
+        panel = is_train_panel.copy()
+        panel["score"] = np.nan
+
+        for i, fold in enumerate(self.folds):
+            model = self.models[i] if i < len(self.models) else None
+            if model is None:
+                continue
+            mask = (dates >= fold.val_start) & (dates <= fold.val_end)
+            sub = is_train_panel.loc[mask]
+            if len(sub) == 0:
+                continue
+            panel.loc[mask, "score"] = model.predict(sub)
 
         if normalize:
             panel["score"] = panel.groupby("TRADE_DATE")["score"].transform(
@@ -394,13 +488,20 @@ class RollingTrainer:
         score_wide.index.name = "TRADE_DATE"
         return score_wide
 
+    # ── IC 报告 ─────────────────────────────────────────────────────
     def fold_ic_report(self) -> pd.DataFrame:
-        """返回每个 Fold 的 IC 汇总报告。"""
+        """返回每个 Fold 在 Val 集上的 IC 汇总报告。"""
         return pd.DataFrame(self.fold_metrics)
 
+    def ensemble_fold_ids(self) -> List[int]:
+        """返回当前会被用于 IS Test 集成的 Fold ID 列表。"""
+        selected = self._select_ensemble_folds()
+        return [self.folds[i].fold_id for i in selected]
+
+    # ── Feature Importance ─────────────────────────────────────────
     def get_feature_importance(self) -> Optional[pd.DataFrame]:
         """
-        汇总所有 Fold 的 XGBoost feature importance。
+        汇总所有 Fold 的 XGBoost feature importance (gain)。
         仅对 XGBTrainer 有效, 其他模型返回 None。
         """
         rows = []
@@ -410,8 +511,7 @@ class RollingTrainer:
             xgb_model = getattr(model, "model", None)
             if xgb_model is None or not hasattr(xgb_model, "get_score"):
                 continue
-            scores = xgb_model.get_score(importance_type="gain")
-            for feat, gain in scores.items():
+            for feat, gain in xgb_model.get_score(importance_type="gain").items():
                 rows.append({"fold_id": i + 1, "feature": feat, "gain": gain})
 
         if not rows:
@@ -421,34 +521,31 @@ class RollingTrainer:
         summary = df.groupby("feature")["gain"].agg(["mean", "std", "count"]).reset_index()
         summary.columns = ["feature", "mean_gain", "std_gain", "n_folds"]
         summary = summary.sort_values("mean_gain", ascending=False)
-        logger.info("Feature importance 汇总: %d 个特征, top5: %s",
-                    len(summary), list(summary["feature"].head(5)))
         return summary
 
+    # ── 持久化 ──────────────────────────────────────────────────────
     def save_model(self, path: Optional[Path] = None) -> Path:
-        """保存所有 Fold 模型 + 元数据。``TransformerTrainer`` 按折只存 state_dict, 可正常 pickle 落盘。"""
+        """保存所有 Fold 模型 + 元数据。"""
         path = Path(path or (config.SCORE_OUTPUT_DIR / "rolling_model.pkl"))
         path.parent.mkdir(parents=True, exist_ok=True)
 
         save_data: Dict[str, Any] = {
+            "version": _ROLL_MDL_V3,
             "folds": self.folds,
             "fold_metrics": self.fold_metrics,
             "feature_names": self.feature_names,
             "model_class_name": self.model_class.__name__,
             "model_kwargs": self.model_kwargs,
-            "train_start": self.train_start,
-            "first_train_months": self.first_train_months,
+            "is_train_start": self.is_train_start,
+            "is_train_end": self.is_train_end,
             "val_months": self.val_months,
+            "n_ensemble": self.n_ensemble,
+            "model_states": [
+                _pack_fold_model(m, self.model_class) if m is not None else None
+                for m in self.models
+            ],
         }
-        model_states: List[Any] = []
-        for m in self.models:
-            if m is None:
-                model_states.append(None)
-            else:
-                model_states.append(
-                    _pack_rolling_fold_model(m, self.model_class),
-                )
-        save_data["model_states"] = model_states
+
         with open(path, "wb") as f:
             pickle.dump(save_data, f)
         logger.info("滚动模型已保存: %s (%d folds)", path, len(self.folds))
@@ -460,18 +557,17 @@ class RollingTrainer:
         with open(path, "rb") as f:
             data = pickle.load(f)
 
-        self.folds = data["folds"]
-        self.fold_metrics = data["fold_metrics"]
+        self.folds         = data["folds"]
+        self.fold_metrics  = data["fold_metrics"]
         self.feature_names = data["feature_names"]
-        self.train_start = data["train_start"]
-        self.first_train_months = data["first_train_months"]
-        self.val_months = data["val_months"]
+        self.is_train_start = data.get("is_train_start", self.is_train_start)
+        self.is_train_end   = data.get("is_train_end",   self.is_train_end)
+        self.val_months     = data.get("val_months",     self.val_months)
+        self.n_ensemble     = data.get("n_ensemble",     self.n_ensemble)
 
-        self.models = []
-        for state in data["model_states"]:
-            self.models.append(
-                _unpack_rolling_fold_model(state, self.model_class),
-            )
-
+        self.models = [
+            _unpack_fold_model(state, self.model_class)
+            for state in data["model_states"]
+        ]
         logger.info("滚动模型已加载: %s (%d folds)", path, len(self.folds))
         return self

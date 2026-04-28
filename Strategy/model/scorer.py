@@ -1,21 +1,23 @@
 """
-模型打分模块: 使用训练好的模型对全市场股票生成每日标准化打分。
+模型打分模块: 生成每日全市场标准化打分宽表。
 
-输出: 标准宽表 (index=TRADE_DATE, columns=股票代码, values=打分)
+支持两种调用路径:
+  1. 单模型打分 (score_all):
+       直接使用一个已训练的模型对整个 Panel 预测
 
-支持任意实现 predict(df) -> np.ndarray 接口的模型:
-- XGBTrainer
-- TransformerTrainer
-- 其他自定义模型
+  2. IS Test 集成打分 (generate_is_test_scores):
+       通过 RollingTrainer.predict_is_test() 执行 4-Fold Ensemble
+
+输出格式: 标准宽表 (index=TRADE_DATE, columns=股票代码, values=打分)
 """
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from Strategy import config
 from Strategy.data_io.saver import save_wide_table
@@ -24,11 +26,15 @@ from Strategy.model.trainer import build_panel
 logger = logging.getLogger(__name__)
 
 
-def _load_current_price_mask(label_tag: str, index: pd.Index, columns: pd.Index) -> Optional[pd.DataFrame]:
-    """T 日当前可交易价格 mask; 不使用未来 label 非空性。"""
+# ═══════════════════════════════════════════════════════════════════════
+# 辅助: 按 T 日可交易价格 mask 剔除停牌/退市股
+# ═══════════════════════════════════════════════════════════════════════
+
+def _load_price_mask(label_tag: str, index: pd.Index, columns: pd.Index) -> Optional[pd.DataFrame]:
+    """加载 T 日交易价格表, 返回可交易 bool mask。"""
     price_path = config.LABEL_OUTPUT_DIR / f"{label_tag}.fea"
     if not price_path.exists():
-        logger.warning("价格表不存在, 无法按 T 日价格 mask score: %s", price_path)
+        logger.warning("价格表不存在，无法按 T 日价格 mask: %s", price_path)
         return None
     price_df = pd.read_feather(price_path).set_index("TRADE_DATE")
     price_df.index = pd.DatetimeIndex(price_df.index)
@@ -36,23 +42,27 @@ def _load_current_price_mask(label_tag: str, index: pd.Index, columns: pd.Index)
     return price_df.reindex(index=pd.DatetimeIndex(index), columns=columns).notna()
 
 
-def mask_scores_by_current_price(
+def mask_scores_by_price(
     score_wide: pd.DataFrame,
     label_tag: str = "TWAP_1430_1457",
 ) -> pd.DataFrame:
-    """剔除 T 日没有执行价格的股票, 避免退市/停牌股票进入后续回测候选。"""
+    """剔除 T 日无执行价格的股票, 避免停牌/退市股进入回测候选池。"""
     out = score_wide.copy()
     out.index = pd.DatetimeIndex(out.index)
     out.columns = pd.Index([str(c).zfill(6) for c in out.columns])
-    mask = _load_current_price_mask(label_tag, out.index, out.columns)
+    mask = _load_price_mask(label_tag, out.index, out.columns)
     if mask is None:
         return out
     before = int(out.notna().sum().sum())
     out = out.where(mask)
     after = int(out.notna().sum().sum())
-    logger.info("score 已按 T 日价格 mask: before=%d after=%d removed=%d", before, after, before - after)
+    logger.info("price mask: before=%d after=%d removed=%d", before, after, before - after)
     return out
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# 打分函数
+# ═══════════════════════════════════════════════════════════════════════
 
 def score_all(
     trainer: Any,
@@ -60,11 +70,14 @@ def score_all(
     normalize: bool = True,
 ) -> pd.DataFrame:
     """
-    对 Panel 中所有日期的股票生成打分, 输出为宽表。
+    对 Panel 中所有日期的股票生成打分, 输出宽表。
+
+    适用于: 单个已训练模型 (XGBTrainer / TransformerTrainer) 的全量推理。
+    IS Test 集成推理请使用 generate_is_test_scores()。
 
     Parameters
     ----------
-    trainer : XGBTrainer | TransformerTrainer | Any
+    trainer : Any
         已训练好的模型, 需实现 predict(df) -> np.ndarray
     panel : pd.DataFrame
         含因子列的 Panel 长表
@@ -74,7 +87,7 @@ def score_all(
     Returns
     -------
     pd.DataFrame
-        标准宽表 (index=TRADE_DATE, columns=股票代码, values=打分)
+        打分宽表 (index=TRADE_DATE, columns=股票代码)
     """
     raw_scores = trainer.predict(panel)
     panel = panel.copy()
@@ -100,16 +113,64 @@ def generate_scores(
     output_dir: Optional[Path] = None,
 ) -> Path:
     """
-    端到端打分流水线: 拼接 Panel -> 预测 -> 保存宽表。
+    端到端打分流水线 (单模型): 拼接 Panel → 预测 → 价格 mask → 保存宽表。
 
     Parameters
     ----------
-    trainer : XGBTrainer | TransformerTrainer | Any
-        已训练好的模型, 需实现 predict(df) -> np.ndarray
+    trainer : Any
+        已训练好的模型
     factor_dict : dict
         {factor_name: wide_df}
     label_df : pd.DataFrame
         Label 宽表 (仅用于对齐日期和股票, 打分时不使用 label 值)
+    model_name : str
+        模型标识, 用于命名输出文件
+    label_tag : str
+        Label 标识
+    normalize : bool
+        是否截面标准化
+    output_dir : Path, optional
+        输出目录, 默认 config.SCORE_OUTPUT_DIR
+
+    Returns
+    -------
+    Path  保存路径
+    """
+    out = Path(output_dir or config.SCORE_OUTPUT_DIR)
+    panel = build_panel(factor_dict, label_df)
+    score_wide = score_all(trainer, panel, normalize=normalize)
+    score_wide = mask_scores_by_price(score_wide, label_tag=label_tag)
+    fname = f"SCORE_{model_name}_{label_tag}.fea"
+    path = save_wide_table(score_wide, out / fname)
+    logger.info("打分已保存: %s, shape=%s", path, score_wide.shape)
+    return path
+
+
+def generate_is_test_scores(
+    rolling_trainer: Any,
+    factor_dict: Dict[str, pd.DataFrame],
+    label_df: pd.DataFrame,
+    model_name: str = "rolling",
+    label_tag: str = "TWAP_1430_1457",
+    normalize: bool = True,
+    output_dir: Optional[Path] = None,
+) -> Path:
+    """
+    IS Test Set 4-Fold Ensemble 打分流水线。
+
+    流程:
+      1. 构建 IS Test Panel (仅保留 IS_TEST_START ~ IS_TEST_END 的行)
+      2. 调用 RollingTrainer.predict_is_test() 执行 4-Fold Ensemble
+      3. 价格 mask → 保存宽表
+
+    Parameters
+    ----------
+    rolling_trainer : RollingTrainer
+        已完成 train_all_folds() 的 RollingTrainer 实例
+    factor_dict : dict
+        {factor_name: wide_df}
+    label_df : pd.DataFrame
+        Label 宽表 (对齐用)
     model_name : str
         模型标识
     label_tag : str
@@ -123,28 +184,54 @@ def generate_scores(
     -------
     Path  保存路径
     """
-    out = output_dir or config.SCORE_OUTPUT_DIR
+    from Strategy.model.trainer import split_panel
 
+    out = Path(output_dir or config.SCORE_OUTPUT_DIR)
     panel = build_panel(factor_dict, label_df)
-    score_wide = score_all(trainer, panel, normalize=normalize)
-    score_wide = mask_scores_by_current_price(score_wide, label_tag=label_tag)
 
-    fname = f"SCORE_{model_name}_{label_tag}.fea"
+    # 仅保留 IS Test 部分
+    _, is_test_panel, _ = split_panel(panel)
+    if len(is_test_panel) == 0:
+        raise ValueError(
+            "IS Test Panel 为空: 请检查 factor_dict / label_df 的日期覆盖是否包含 IS Test 区间 "
+            f"[{config.IS_TEST_START}, {config.IS_TEST_END}]"
+        )
+
+    score_wide = rolling_trainer.predict_is_test(is_test_panel, normalize=normalize)
+    score_wide = mask_scores_by_price(score_wide, label_tag=label_tag)
+
+    fname = f"SCORE_{model_name}_IS_TEST_{label_tag}.fea"
     path = save_wide_table(score_wide, out / fname)
-    logger.info("打分已保存: %s, shape=%s", path, score_wide.shape)
+    logger.info("IS Test 集成打分已保存: %s, shape=%s", path, score_wide.shape)
     return path
 
 
 def load_scores(
-    model_name: str = "xgb",
+    model_name: str = "rolling",
     label_tag: str = "TWAP_1430_1457",
+    is_test: bool = True,
 ) -> pd.DataFrame:
-    """快捷加载已保存的打分宽表"""
-    fname = f"SCORE_{model_name}_{label_tag}.fea"
+    """
+    快捷加载已保存的打分宽表。
+
+    Parameters
+    ----------
+    model_name : str
+        模型标识
+    label_tag : str
+        Label 标识
+    is_test : bool
+        True → 加载 IS Test 集成打分 (SCORE_{model}_IS_TEST_{label}.fea)
+        False → 加载普通打分 (SCORE_{model}_{label}.fea)
+    """
+    if is_test:
+        fname = f"SCORE_{model_name}_IS_TEST_{label_tag}.fea"
+    else:
+        fname = f"SCORE_{model_name}_{label_tag}.fea"
+
     path = config.SCORE_OUTPUT_DIR / fname
     if not path.exists():
         raise FileNotFoundError(f"打分文件不存在: {path}")
-    df = pd.read_feather(path)
-    df = df.set_index("TRADE_DATE")
-    df = mask_scores_by_current_price(df, label_tag=label_tag)
+    df = pd.read_feather(path).set_index("TRADE_DATE")
+    df = mask_scores_by_price(df, label_tag=label_tag)
     return df

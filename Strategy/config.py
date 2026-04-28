@@ -25,20 +25,23 @@ BT_RESULT_DIR = OUTPUT_DIR / "bt_results"
 PIPELINE_HOLDOUT_SCORE_DIR = SCORE_OUTPUT_DIR / "pipeline_holdout"
 PIPELINE_HOLDOUT_BT_DIR = BT_RESULT_DIR / "pipeline_holdout"
 
-# ── 样本内外划分 ────────────────────────────────────────────────────────
-# 注意: TRAIN/VAL 闭区间; 须与 build_panel 实际有数据的 TRADE_DATE 有交集。
-# 易错: TRAIN_END 若早于 panel 的最早日期，则训练集 0 行。此前默认可写成 8 月 1 日，
-#      会排除 8 月 2 日~31 日，故 END 用当月最后一个自然日更稳妥。
-TRAIN_START = dt.date(2021, 1, 1)
-TRAIN_END = dt.date(2023, 8, 31)
+# ── 样本内外划分 (基于 Rolling Val CV 的 IS/OOS 三段) ─────────────────
+#
+# IS Train Set: 用于 Rolling Val CV 内部训练与验证 (Val 仅用于早停)
+# IS Test Set:  不参与梯度更新；用 4-Fold Ensemble 评估泛化效果
+# OOS:          严禁用于任何参数决策；仅当 IS Test 达标后才允许推进
+#
+IS_TRAIN_START = dt.date(2021, 1, 1)
+IS_TRAIN_END   = dt.date(2023, 9, 30)   # IS 训练集闭区间上界 (含)
 
-VAL_START = dt.date(2023, 9, 1)
-VAL_END = dt.date(2024, 8, 31)   # 验证集闭区间上界 (含), 须 < OOS_START
+IS_TEST_START  = dt.date(2023, 10, 1)
+IS_TEST_END    = dt.date(2024, 9, 1)    # IS 测试集闭区间上界 (含)
 
-OOS_START = dt.date(2024, 9, 1)  # 纯样本外起始 (含), 须 > VAL_END; 严禁用于任何参数决策
+OOS_START      = dt.date(2024, 9, 1)    # 纯样本外起始 (含); 严禁用于任何参数决策
 
 # ── 滚动训练参数 ────────────────────────────────────────────────────────
-ROLLING_VAL_MONTHS = 3            # 每个 Fold 验证窗口（月数）
+ROLLING_VAL_MONTHS = 3            # 每个 Fold 验证窗口月数 (季度)
+ENSEMBLE_N_FOLDS   = 4            # IS Test 推理时选取最近 N 个 Fold 做集成
 
 # ── Label 预处理 ────────────────────────────────────────────────────────
 LABEL_WINSORIZE_SIGMA = 3.0       # 截面 Winsorize 阈值（σ 倍数）, 0 = 不做
