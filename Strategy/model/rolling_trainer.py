@@ -49,8 +49,8 @@ _ROLL_KEY_PICKLE = "pickle"
 # ═══════════════════════════════════════════════════════════════════════
 
 def _pack_fold_model(model: Any, model_class: Type) -> Dict[str, Any]:
-    """单折模型序列化: Transformer 存 state_dict, 其余 pickle。"""
-    if model_class.__name__ == "TransformerTrainer" and getattr(model, "model", None) is not None:
+    """单折模型序列化: Transformer / MLP 存 state_dict, 其余 pickle。"""
+    if model_class.__name__ in ("TransformerTrainer", "MLPTrainer") and getattr(model, "model", None) is not None:
         import torch
         buf = io.BytesIO()
         torch.save(
@@ -83,15 +83,23 @@ def _unpack_fold_model(
     if kind == _ROLL_KEY_TRANSFORMER:
         import torch
         from Strategy.model.transformer_trainer import CrossSectionalTransformerModel
+        from Strategy.model.mlp_trainer import CrossSectionalMLPModel
+
         d = torch.load(io.BytesIO(blob), map_location="cpu", weights_only=False)
         t = model_class()
         t.feature_names = d["feature_names"]
         t._hparams = d["hparams"]
-        # 重建网络结构
-        t.model = CrossSectionalTransformerModel(**{
-            k: d["hparams"][k]
-            for k in ("d_input", "d_model", "nhead", "num_layers", "d_ff", "dropout")
-        })
+
+        if model_class.__name__ == "MLPTrainer":
+            t.model = CrossSectionalMLPModel(**d["hparams"])
+        elif model_class.__name__ == "TransformerTrainer":
+            t.model = CrossSectionalTransformerModel(**{
+                k: d["hparams"][k]
+                for k in ("d_input", "d_model", "nhead", "num_layers", "d_ff", "dropout")
+            })
+        else:
+            raise ValueError(f"Torch 序列化仅支持 TransformerTrainer / MLPTrainer, 收到: {model_class.__name__!r}")
+
         t.model.load_state_dict(d["state_dict"])
         t.model.eval()
         return t
@@ -187,7 +195,7 @@ def generate_folds(
 
 class RollingTrainer:
     """
-    Rolling Val CV 训练编排器, 支持任意模型类 (XGBTrainer / TransformerTrainer)。
+    Rolling Val CV 训练编排器, 支持任意模型类 (XGBTrainer / TransformerTrainer / MLPTrainer)。
 
     训练逻辑 (strategy_rules.md §3):
       对 IS Train Set 内部做时间块切割 CV:

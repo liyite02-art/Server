@@ -9,7 +9,7 @@ daily_factor_library.py
     from Strategy.factor.daily_factor_library import DailyFactorLibraryAdapter
     adapter = DailyFactorLibraryAdapter()
     saved = adapter.compute_and_save_all(
-        start_date=config.TRAIN_START, end_date=config.TRAIN_END,
+        start_date=config.IS_TRAIN_START, end_date=config.IS_TRAIN_END,
     )
     print(f"共保存 {len(saved)} 个因子")
 
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 _EPS = 1e-9
 
-# 可接受的日期类型: 与 config 中 TRAIN_START 等一致
+# 可接受的日期类型: 与 config 中 IS_TRAIN_START 等一致
 DateLike = Union[str, int, pd.Timestamp, _dt.date, _dt.datetime]
 
 
@@ -160,7 +160,7 @@ class DailyFactorLibraryAdapter:
             从 Daily_data 读入时的截止日期 (防未来), 如 "2024-12-31" 或 20241231.
         start_date, end_date : 可选
             仅计算该区间内的**输出**交易日, 可传 int(YYYYMMDD) / 字符串 / datetime.date
-            与 `Strategy.config` 中 TRAIN_START, TRAIN_END 配合使用.
+            与 `Strategy.config` 中 IS_TRAIN_START, IS_TRAIN_END 配合使用.
         skip_existing
             True 时跳过已存在的 .fea 文件, 方便增量更新.
         chunk_size : int

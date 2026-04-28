@@ -345,10 +345,10 @@ oos:    [OOS_START,   +∞)
 端到端打分流水线：
 1. 调用 `build_panel` 拼接 Panel
 2. 模型预测 → 截面 Z-Score 标准化
-3. 用 T 日价格 mask 屏蔽退市/停牌股票（`mask_scores_by_current_price`）
+3. 用 T 日价格 mask 屏蔽退市/停牌股票（`mask_scores_by_price`）
 4. 保存为 `SCORE_{model_name}_{label_tag}.fea`
 
-**`mask_scores_by_current_price(score_wide, label_tag)`**
+**`mask_scores_by_price(score_wide, label_tag)`**
 
 屏蔽 T 日无执行价格的股票，防止退市/停牌股进入回测候选：
 - 读取 `{label_tag}.fea`（T 日价格锚点文件）
@@ -564,7 +564,7 @@ Score(T) = model(因子(T))        ← 只含 T-1 信息，T日可用于选股
 ### 股票池过滤
 
 回测股票池过滤只使用 T 日可知信息：
-- T 日 TWAP 是否有数据（`mask_scores_by_current_price`）
+- T 日 TWAP 是否有数据（`mask_scores_by_price`）
 - T 日是否涨停（`LIMIT_UP_PRICE`）
 - 上市天数（`ipo_dates`）
 - 距退市日天数（`out_date`）
@@ -603,7 +603,7 @@ Score(T) = model(因子(T))        ← 只含 T-1 信息，T日可用于选股
 
 1. 在 `label_generator.py` 中添加新的计算函数
 2. 确保 label.loc[T] = T 日买入到 T+1 日卖出的实际收益率（考虑除息除权）
-3. 保存对应的 T 日**买入价格表**（文件名须与 `label_tag` 一致），供 `scorer._load_current_price_mask` 使用：
+3. 保存对应的 T 日**买入价格表**（文件名须与 `label_tag` 一致），供 `scorer._load_price_mask` 使用：
    - TWAP Label：`TWAP_{start}_{end}.fea`
    - 自定义 Label（如 `MY_LABEL`）：同时保存 `MY_LABEL.fea`（T 日买入价）和 `LABEL_MY_LABEL.fea`（收益率）
 4. 在 `load_label()` 的 docstring 中登记新 tag

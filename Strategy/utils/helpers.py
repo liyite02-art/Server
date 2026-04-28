@@ -79,11 +79,16 @@ def ensure_tradedate_as_index(df: pd.DataFrame) -> pd.DataFrame:
     TRADE_DATE 仍留在列中, 与 label 的日期索引做 ``intersection`` 得到空/错位。
 
     对已从索引正确加载的表, 若列中无 ``TRADE_DATE`` 则仅做 ``normalize``。
+
+    股票列名统一为 6 位数字字符串, 避免与因子列 (str) 和 Label 列 (int) 混用导致
+    ``Index.intersection`` 为空、``build_panel`` 报 stocks=0。
     """
     out = df.copy()
     if "TRADE_DATE" in out.columns:
         out = out.set_index("TRADE_DATE", drop=True)
-    return normalize_tradedate_index(out)
+    out = normalize_tradedate_index(out)
+    out.columns = standardize_stock_column(out.columns)
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════

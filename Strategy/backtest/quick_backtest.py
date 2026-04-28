@@ -196,7 +196,7 @@ def quantile_backtest(
         分组数
     start_date : pd.Timestamp, optional
         回测起始日 (含). 默认 None 表示不限制.
-        ⚠️ 强烈建议设置为 config.OOS_START 或 config.VAL_START,
+        ⚠️ 强烈建议设置为 config.OOS_START 或 config.IS_TEST_START,
            避免将训练集日期（样本内）纳入统计，导致虚高收益。
     end_date : pd.Timestamp, optional
         回测截止日 (含). 默认 None 表示不限制.

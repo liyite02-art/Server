@@ -160,14 +160,14 @@ def export_factor_report_discrete_ic_then_bt(
     **kwargs: Any,
 ) -> None:
     """先只做 IC 目录, 再 quick 且 ``run_ic=False`` (与 pipeline 一致)。"""
-    kwargs.setdefault("val_start", config.VAL_START)
+    kwargs.setdefault("val_start", config.IS_TEST_START)
     kwargs.setdefault("end_date", None)
     kwargs.setdefault("twap_tag", "OPEN0935_1000")
     base = out_root / sanitize_dir_name(factor_name)
     base.mkdir(parents=True, exist_ok=True)
     s = _standardize_wide_like_pipeline(score_df)
     l = _standardize_wide_like_pipeline(label_df)
-    t0 = pd.Timestamp(kwargs.get("val_start", config.VAL_START))
+    t0 = pd.Timestamp(kwargs.get("val_start", config.IS_TEST_START))
 
     run_ic_analysis(
         s, l,

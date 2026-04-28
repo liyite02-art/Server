@@ -39,18 +39,28 @@ IS_TEST_END    = dt.date(2024, 9, 1)    # IS 测试集闭区间上界 (含)
 
 OOS_START      = dt.date(2024, 9, 1)    # 纯样本外起始 (含); 严禁用于任何参数决策
 
+# 历史命名 / ic_analysis 分段：与上列 IS 区间一一对应（「Val」= 样本内测试集 IS Test，非滚动 CV 的 val）
+TRAIN_START    = IS_TRAIN_START
+TRAIN_END      = IS_TRAIN_END
+VAL_START      = IS_TEST_START
+VAL_END        = IS_TEST_END
+
 # ── 滚动训练参数 ────────────────────────────────────────────────────────
 ROLLING_VAL_MONTHS = 3            # 每个 Fold 验证窗口月数 (季度)
 ENSEMBLE_N_FOLDS   = 4            # IS Test 推理时选取最近 N 个 Fold 做集成
 
+# 截面神经网络 (MLP / Transformer): batch_size 表示「每个优化步合并的交易日数」。
+# strategy_rules.md 要求 batch_size=1（单日截面、日期间无批量耦合）。
+NN_TRAINER_BATCH_SIZE = 1
+
 # ── Label 预处理 ────────────────────────────────────────────────────────
-LABEL_WINSORIZE_SIGMA = 3.0       # 截面 Winsorize 阈值（σ 倍数）, 0 = 不做
+LABEL_WINSORIZE_SIGMA = 0.0       # 截面 Winsorize 阈值（σ 倍数）, 0 = 不做
 
 # 日频因子落盘 (DailyFactorLibraryAdapter.compute_and_save_all)
 # 特征（因子）在验证集、样本外预测与回测中仍然需要，与「标签是否用于训练」无关。
 # 只要不对 OOS 做调参/选模，在 OOS 上计算因子不属于标签泄露。建议:
-#   start_date = TRAIN_START（或数据起点）, end_date = None（Daily_data 末交易日，含 VAL/OOS）
-# 仅当调试或极省算力时，才可收窄为 end_date=TRAIN_END，此时 val/oos/打分会缺行或不可用。
+#   start_date = IS_TRAIN_START（或数据起点）, end_date = None（Daily_data 末交易日，含 IS_Test/OOS）
+# 仅当调试或极省算力时，才可收窄为 end_date=IS_TRAIN_END，此时 is_test/oos/打分会缺行或不可用。
 
 # ── 交易时间常量 (分钟频 time 字段为 int, 如 925, 930, 1500) ───────────
 AUCTION_TIME = 925               # 集合竞价

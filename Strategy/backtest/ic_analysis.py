@@ -149,16 +149,19 @@ def compute_ic_summary(
     """
     对 IC / Rank IC 按 Train / Val / OOS / Overall 四段统计。
 
+    分段默认边界取自 config：Train = IS 训练集；图表中的「Val」列对应样本内测试集
+    (IS Test)，非 Rolling CV 的验证窗。
+
     Returns
     -------
     pd.DataFrame
         multi-index: (metric, segment)
         columns: n_days / mean / std / icir / win_rate
     """
-    train_start = pd.Timestamp(train_start or config.TRAIN_START)
-    train_end   = pd.Timestamp(train_end   or config.TRAIN_END)
-    val_start   = pd.Timestamp(val_start   or config.VAL_START)
-    val_end     = pd.Timestamp(val_end     or config.VAL_END)
+    train_start = pd.Timestamp(train_start or config.IS_TRAIN_START)
+    train_end   = pd.Timestamp(train_end   or config.IS_TRAIN_END)
+    val_start   = pd.Timestamp(val_start   or config.IS_TEST_START)
+    val_end     = pd.Timestamp(val_end     or config.IS_TEST_END)
     oos_start   = pd.Timestamp(oos_start   or config.OOS_START)
 
     idx = pd.DatetimeIndex(ic_df.index)
@@ -210,7 +213,7 @@ def plot_ic_analysis(
       右下: 各段 ICIR 对比柱状图
     """
     oos_ts = pd.Timestamp(oos_start or config.OOS_START)
-    val_ts = pd.Timestamp(val_start or config.VAL_START)
+    val_ts = pd.Timestamp(val_start or config.IS_TEST_START)
 
     ic_s   = ic_df["ic"].dropna()
     ric_s  = ic_df["rank_ic"].dropna()

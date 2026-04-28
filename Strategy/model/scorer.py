@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -235,3 +235,67 @@ def load_scores(
     df = pd.read_feather(path).set_index("TRADE_DATE")
     df = mask_scores_by_price(df, label_tag=label_tag)
     return df
+
+
+def load_score_feather(
+    path: Union[str, Path],
+    label_tag: Optional[str] = None,
+    apply_price_mask: bool = True,
+) -> pd.DataFrame:
+    """
+    读取 ``save_wide_table`` 落盘的 Feather 宽表（含 ``TRADE_DATE`` 列）。
+
+    Parameters
+    ----------
+    path
+        ``.fea`` 文件路径
+    label_tag
+        若 ``apply_price_mask=True``，按该 tag 加载 ``{LABEL_OUTPUT_DIR}/{label_tag}.fea`` 做可交易 mask
+    apply_price_mask
+        是否再次套用 ``mask_scores_by_price``（与训练后落盘时一致）
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"打分文件不存在: {path}")
+    df = pd.read_feather(path).set_index("TRADE_DATE")
+    df.index = pd.DatetimeIndex(df.index)
+    if apply_price_mask and label_tag:
+        df = mask_scores_by_price(df, label_tag=label_tag)
+    return df
+
+
+def load_is_test_scores_from_disk(
+    label_tag: str,
+    score_dir: Optional[Path] = None,
+    *,
+    apply_price_mask: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    """
+    加载 ``main.ipynb`` 在 ``config.SCORE_OUTPUT_DIR`` 下保存的 IS Test 打分::
+
+        SCORE_xgb_{label_tag}_is_test.fea
+        SCORE_transformer_{label_tag}_is_test.fea
+        SCORE_mlp_{label_tag}_is_test.fea
+        SCORE_ensemble_{label_tag}_is_test.fea
+
+    若某个模型文件不存在则跳过该键 (不打断仅训练了部分模型的流程)。
+
+    Returns
+    -------
+    dict
+        键为 ``xgb`` / ``transformer`` / ``mlp`` / ``ensemble`` 中存在的子集
+    """
+    d = Path(score_dir or config.SCORE_OUTPUT_DIR)
+    keys = ("xgb", "transformer", "mlp", "ensemble")
+    out: Dict[str, pd.DataFrame] = {}
+    for k in keys:
+        p = d / f"SCORE_{k}_{label_tag}_is_test.fea"
+        if not p.exists():
+            logger.info("IS Test 打分文件缺失, 跳过: %s", p.name)
+            continue
+        out[k] = load_score_feather(
+            p,
+            label_tag=label_tag if apply_price_mask else None,
+            apply_price_mask=apply_price_mask,
+        )
+    return out

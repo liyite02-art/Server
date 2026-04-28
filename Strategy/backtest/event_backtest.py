@@ -18,7 +18,7 @@
         rebalance_freq=1,
         frictionless=True,
     )
-    result = runner.run(start_date=config.VAL_START, end_date=None)
+    result = runner.run(start_date=config.IS_TEST_START, end_date=None)
     result.plot(save_dir="outputs/bt_results")
     result.save_details(config.BT_RESULT_DIR)
 """

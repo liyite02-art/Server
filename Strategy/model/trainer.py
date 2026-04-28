@@ -227,9 +227,24 @@ def build_panel(
     common_stocks = common_stocks.sort_values()
 
     if len(common_dates) == 0 or len(common_stocks) == 0:
+        hints = []
+        if len(label_df.columns) == 0:
+            hints.append(
+                "当前 Label 宽表 **无任何股票列**（常见于 LABEL_OPEN930_1000.fea 损坏或未正确生成："
+                "需 `min_data` 分钟线在 09:30/10:00 有 open）。请删除 outputs/labels 下对应 LABEL 后重新运行 "
+                "`generate_and_save_open930_1000_label()`。"
+            )
+        elif len(common_stocks) == 0 and len(factor_dict) > 0:
+            f0 = next(iter(factor_dict.values()))
+            hints.append(
+                f"Label 有 {len(label_df.columns)} 只股票列，但与因子无交集；"
+                f"请确认因子目录与 Label 为同一套股票代码口径（已自动 zfill(6)）。"
+                f"示例 label 列={list(label_df.columns[:3])} 示例因子列={list(f0.columns[:3])}"
+            )
         raise ValueError(
             f"无公共交易日或股票: dates={len(common_dates)} stocks={len(common_stocks)}.\n"
-            "可能原因: 因子行索引类型与 label 不一致; 或因子与 label 的股票列名不匹配 (检查 6 位数字字符串)。"
+            + ("\n".join(hints) if hints else "")
+            + "\n其他可能原因: 因子行索引与 label 日期类型不一致。"
         )
 
     logger.info(

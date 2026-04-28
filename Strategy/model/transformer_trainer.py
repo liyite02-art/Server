@@ -230,8 +230,9 @@ class TransformerTrainer:
 
     接口与 XGBTrainer 完全一致，可无缝接入 RollingTrainer / scorer.py。
 
-    注意: batch_size 指每次梯度更新使用的「天数」(非股票数)。
-    每日截面内所有股票作为一个 token 序列输入网络，符合 batch=1 的设计原则。
+    注意: batch_size 指每次梯度更新合并的「交易日数」(非股票数)。
+    默认 ``config.NN_TRAINER_BATCH_SIZE`` (=1)：每次优化步仅含单日截面，与 ``strategy_rules.md`` 一致；
+    若设为大于 1，同一梯度步会耦合多个交易日（仅在你明确接受时再使用）。
 
     Parameters
     ----------
@@ -252,7 +253,7 @@ class TransformerTrainer:
     weight_decay : float
         L2 正则化系数
     batch_size : int
-        每批天数 (每天 ~5000 stocks 作为一个截面)
+        每优化步合并的交易日数；默认 1（单日截面 × 若干股票）
     early_stopping_patience : int
         验证集无改善的容忍轮数 (Val 仅用于早停)
     device : str
@@ -273,11 +274,11 @@ class TransformerTrainer:
         epochs: int = 50,
         lr: float = 5e-4,
         weight_decay: float = 0.01,
-        batch_size: int = 16,
+        batch_size: int = config.NN_TRAINER_BATCH_SIZE,
         early_stopping_patience: int = 8,
         device: str = "cuda",
         use_amp: bool = False,
-        label_winsorize_sigma: float = 3.0,
+        label_winsorize_sigma: float = config.LABEL_WINSORIZE_SIGMA,
     ):
         self.d_model    = d_model
         self.nhead      = nhead
