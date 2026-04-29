@@ -42,10 +42,8 @@ Strategy/
 │
 ├── factor/
 │   ├── factor_base.py             # FactorBase 抽象类 + FactorRegistry 注册器
-│   ├── daily_factor_library.py    # 日频因子批量计算适配器（80+ 因子）
-│   ├── daily_factors_raw.py       # 原始因子计算函数库
-│   ├── minute_derived_factors.py  # 分钟数据衍生因子（Jump/CR/Boll）
-│   └── custom_factors.py          # 用户自定义新增因子入口
+│   ├── daily_factor.py            # 纯日频因子统一入口（批量库 + 注册式扩展）
+│   └── minute_derived_factors.py  # 分钟数据衍生因子（Jump）
 │
 ├── model/
 │   ├── trainer.py                 # Panel 构建 + XGBoost 训练器
@@ -74,7 +72,7 @@ Strategy/
 Cell 0  → 生成 OPEN0935_1000 Label（可选，新标签时执行）
 Cell 1  → 生成 TWAP Label（默认 14:30–14:57）
 Cell 2  → 计算日频因子库（DailyFactorLibraryAdapter）
-Cell 3  → 计算分钟衍生因子（Jump/CR/Boll）及自定义因子
+Cell 3  → 计算注册式日频扩展因子与分钟 Jump 因子（如需）
 Cell 4  → 加载所有因子 + Label，构建 Panel
 Cell 5  → 训练 XGBoost 模型（Train+Val）
 Cell 6  → 对全市场生成打分（Score）
@@ -234,42 +232,43 @@ price_df = load_price("TWAP_1430_1457")   # 加载 TWAP_1430_1457.fea
 
 框架提供两套并行的因子计算路径，最终都落盘为 `outputs/factors/{name}.fea`。
 
-#### 路径一：日频因子库（`DailyFactorLibraryAdapter`）
+#### 路径一：纯日频因子库（`daily_factor.py`）
 
-处理 `daily_factors_raw.py` 中定义的 80+ 个日频因子，包含：
+处理 `daily_factor.py` 中定义的 80+ 个日频因子，包含：
 - 动量类：N 日收益率、超额收益、MACD 等
 - 波动类：历史波动率、振幅、ATR 等
 - 量价类：换手率、成交量比、涨跌幅 z-score 等
 - 技术指标：RSI、布林带位置、均线偏离等
 
 ```python
-from Strategy.factor.daily_factor_library import DailyFactorLibraryAdapter
+from Strategy.factor.daily_factor import DailyFactorLibraryAdapter
 adapter = DailyFactorLibraryAdapter()
 adapter.compute_and_save_all(start_date="2021-01-01", end_date=None)
 ```
 
 **重要**：`DailyFactorLibraryAdapter` 在保存前对全量因子宽表执行 `shift(1)`，确保 `T` 日存储的因子值只含 `T-1` 及之前的信息。
 
-#### 路径二：分钟衍生因子（`FactorRegistry` + `FactorBase`）
+#### 路径二：注册式纯日频扩展（`FactorRegistry` + `FactorBase`）
 
 ```python
 from Strategy.factor.factor_base import FactorRegistry
-import Strategy.factor.minute_derived_factors   # 注册分钟因子
-import Strategy.factor.custom_factors           # 注册自定义因子
+import Strategy.factor.daily_factor            # 注册纯日频扩展因子
 FactorRegistry.compute_all(daily_data)
 ```
 
-已内置的分钟衍生因子：
+已内置的注册式纯日频扩展因子包括：
 
 | 因子名 | 说明 |
 |--------|------|
-| `jump_variation` | 隔夜跳空强度（基于分钟开盘价） |
-| `cr2` / `cr3` / `cr4` | 中值偏离比（分钟价格中位 vs 开收盘） |
-| `boll_position_norm` | 布林带位置归一化 |
+| `momentum_20d` | 20 日动量 |
+| `volatility_20d` | 20 日波动率 |
+| `turnover_mean_10d` | 10 日平均换手率 |
+| `CR2` / `CR3` / `CR4` | CR 类中值偏离比 |
+| `boll_pos_norm` | 布林带位置归一化 |
 
 #### 自定义新增因子
 
-在 `custom_factors.py` 中继承 `FactorBase` 并用 `@FactorRegistry.register` 注册：
+在 `daily_factor.py` 中继承 `FactorBase` 并用 `@FactorRegistry.register` 注册：
 
 ```python
 @FactorRegistry.register
@@ -283,6 +282,15 @@ class MyFactor(FactorBase):
 ```
 
 > **注意**：通过 `FactorRegistry` 注册的因子，`compute()` 方法必须自行确保 `shift(1)` 防未来数据。`DailyFactorLibraryAdapter` 会对其管理的因子做整体 `shift`，不覆盖注册器路径。
+
+#### 路径三：分钟衍生 Jump 因子
+
+```python
+from Strategy.factor.minute_derived_factors import JumpVariationFactor
+
+jump = JumpVariationFactor()
+jump.compute_and_save(start_date=20210101, end_date=20241231)
+```
 
 加载所有因子：
 
@@ -555,7 +563,7 @@ Score(T) = model(因子(T))        ← 只含 T-1 信息，T日可用于选股
 |------|----------|
 | `DailyFactorLibraryAdapter` | 全量因子宽表计算完毕后统一 `.shift(1)` 再落盘 |
 | 分钟衍生因子（CR/Boll/Jump） | 各自 `compute()` 方法末尾调用 `.shift(1)` |
-| 自定义因子（`custom_factors.py`） | 开发者必须在 `compute()` 末尾手动 `.shift(1)` |
+| 自定义因子（`daily_factor.py` 内注册类） | 开发者必须在 `compute()` 末尾手动 `.shift(1)` |
 | `safe_rolling()` | 内置 `.shift(1)`，调用方无需再次 shift |
 | `scorer.py` | **不做二次 shift**，score.loc[T] 的时效性由因子延迟保证 |
 
@@ -593,11 +601,11 @@ Score(T) = model(因子(T))        ← 只含 T-1 信息，T日可用于选股
 
 ### 新增因子
 
-1. 在 `custom_factors.py` 中添加继承 `FactorBase` 的类
+1. 在 `daily_factor.py` 中添加继承 `FactorBase` 的类
 2. 实现 `name` 属性（全局唯一）和 `compute()` 方法
 3. 在 `compute()` 末尾确保 `shift(1)`
 4. 用 `@FactorRegistry.register` 装饰
-5. 在 `main.ipynb` 对应 Cell 中 `import Strategy.factor.custom_factors` 后调用 `FactorRegistry.compute_all()`
+5. 在 `main.ipynb` 对应 Cell 中 `import Strategy.factor.daily_factor` 后调用 `FactorRegistry.compute_all()`
 
 ### 新增 Label
 

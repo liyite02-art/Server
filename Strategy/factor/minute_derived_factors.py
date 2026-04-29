@@ -1,47 +1,29 @@
 """
-分钟频衍生日频因子: 提取 Lob_tickbytick_base6_lyt.py 中与 daily_factors.py 不重复的因子。
+分钟频衍生日频因子。
 
-已提取因子:
+当前本文件仅保留必须直接读取 ``min_data/*.fea`` 的分钟逻辑。
+任何仅依赖日频宽表即可计算的因子，已统一迁入 ``daily_factor.py``。
+
+已保留因子:
 1. JumpVariationFactor  — 日内跳跃分解 (RV/RVC/RVJ/RVSJ 等 13 个)
-   来源: process_stock_group_var
-   论文: "New Evidence of the Marginal Predictive Content of Small and Large Jumps"
-   原理: 将日内分钟对数收益率分解为连续成分 (RVC) 和跳跃成分 (RVJ 等)
-
-2. ExtraCRFactor         — CR2/CR3/CR4 三种中间价变体
-   来源: process_stock_group_terminal
-   相比 daily_factors.py 已有的 CR1 (midp = (2c+h+l)/4), 新增:
-     CR2: midp = (c+h+l+o)/4
-     CR3: midp = (c+h+l)/3
-     CR4: midp = (h+l)/2
-
-3. BollPositionNormFactor — [0,1] 归一化 Bollinger 位置
-   来源: process_stock_group_terminal
-   daily_factors.py 的 bb_position = (close - mid) / (2*std), 居中在 0
-   本因子 = (close - lower) / (upper - lower), 归一化到 [0,1]
-
-⚠️ 防未来数据:
-- JumpVariationFactor 使用 T 日分钟数据, compute_all() 输出已 shift(1)
-- ExtraCRFactor 和 BollPositionNormFactor 通过 safe_rolling + shift(1) 保证无未来数据
 """
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import pandas as pd
 import numpy as np
 from tqdm.auto import tqdm
 
 from Strategy import config
-from Strategy.data_io.loader import MinuteDataLoader, DailyDataLoader
+from Strategy.data_io.loader import MinuteDataLoader
 from Strategy.data_io.saver import save_wide_table
-from Strategy.factor.factor_base import FactorBase, FactorRegistry
 from Strategy.utils.helpers import get_minute_files, strip_stock_prefix
 
 logger = logging.getLogger(__name__)
 _EPS = 1e-9
-_eps = 1e-5
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -196,92 +178,3 @@ class JumpVariationFactor:
             logger.info("  [%s] 已保存: %s, shape=%s", fname, path, wide.shape)
 
         return saved_paths
-
-
-# ══════════════════════════════════════════════════════════════════
-# Factor 2: CR2 / CR3 / CR4 (日频 OHLCV, FactorBase 子类)
-# ══════════════════════════════════════════════════════════════════
-# CR1: midp = (2*close + high + low) / 4  ← 已在 daily_factors.py 中
-# CR2: midp = (close + high + low + open) / 4  ← 本文件
-# CR3: midp = (close + high + low) / 3         ← 本文件
-# CR4: midp = (high + low) / 2                 ← 本文件
-
-@FactorRegistry.register
-class CR3Factor(FactorBase):
-    """CR3: midp = (close + high + low) / 3, 窗口 26 天"""
-    name = "CR3"
-
-    def compute(self, daily_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-        c = daily_data["CLOSE_PRICE"]
-        h = daily_data["HIGHEST_PRICE"]
-        l = daily_data["LOWEST_PRICE"]
-        midp = (c + h + l) / 3
-        up = (h - midp.shift(1)).clip(lower=0)
-        dn = (midp.shift(1) - l).clip(lower=0)
-        cr3 = (up.rolling(26, min_periods=1).sum() /
-               (dn.rolling(26, min_periods=1).sum() + _eps) * 100)
-        return cr3.shift(1)
-
-
-@FactorRegistry.register
-class CR4Factor(FactorBase):
-    """CR4: midp = (high + low) / 2, 窗口 26 天"""
-    name = "CR4"
-
-    def compute(self, daily_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-        h = daily_data["HIGHEST_PRICE"]
-        l = daily_data["LOWEST_PRICE"]
-        midp = (h + l) / 2
-        up = (h - midp.shift(1)).clip(lower=0)
-        dn = (midp.shift(1) - l).clip(lower=0)
-        cr4 = (up.rolling(26, min_periods=1).sum() /
-               (dn.rolling(26, min_periods=1).sum() + _eps) * 100)
-        return cr4.shift(1)
-
-
-@FactorRegistry.register
-class CR2Factor(FactorBase):
-    """CR2: midp = (close + high + low + open) / 4, 窗口 26 天"""
-    name = "CR2"
-
-    def compute(self, daily_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-        c = daily_data["CLOSE_PRICE"]
-        h = daily_data["HIGHEST_PRICE"]
-        l = daily_data["LOWEST_PRICE"]
-        o = daily_data["OPEN_PRICE"]
-        midp = (c + h + l + o) / 4
-        up = (h - midp.shift(1)).clip(lower=0)
-        dn = (midp.shift(1) - l).clip(lower=0)
-        cr2 = (up.rolling(26, min_periods=1).sum() /
-               (dn.rolling(26, min_periods=1).sum() + _eps) * 100)
-        return cr2.shift(1)
-
-
-# ══════════════════════════════════════════════════════════════════
-# Factor 3: Bollinger Position 归一化到 [0,1]
-# ══════════════════════════════════════════════════════════════════
-@FactorRegistry.register
-class BollPositionNormFactor(FactorBase):
-    """
-    Bollinger Band Position 归一化到 [0,1]。
-
-    daily_factors.py 已有 bb_position = (close - mid) / (2*std), 中心在 0。
-    本因子使用 Lob 文件中的定义:
-        boll_pos_norm = (close - lower) / (upper - lower)
-    取值范围约 [0, 1], 更直观地表示价格在通道内的相对位置。
-
-    窗口 20 天, 2 倍标准差。
-    """
-    name = "boll_pos_norm"
-
-    def compute(self, daily_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-        c = daily_data["CLOSE_PRICE"]
-        window = 20
-        k = 2
-        mid = c.rolling(window, min_periods=max(1, window // 2)).mean()
-        std = c.rolling(window, min_periods=max(1, window // 2)).std()
-        upper = mid + k * std
-        lower = mid - k * std
-        boll_range = upper - lower
-        pos = (c - lower) / boll_range.replace(0, np.nan)
-        return pos.shift(1)

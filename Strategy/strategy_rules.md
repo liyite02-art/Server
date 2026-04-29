@@ -97,7 +97,8 @@ Strategy/
 │   └── label_generator.py   # LabelGenerator (TWAP/VWAP/Close)
 ├── factor/
 │   ├── factor_base.py       # FactorBase 基类 + FactorRegistry 注册器
-│   └── daily_factors.py     # 具体日频因子实现
+│   ├── daily_factor.py      # 纯日频因子统一入口
+│   └── minute_derived_factors.py  # 分钟衍生 Jump 因子
 ├── model/
 │   ├── trainer.py           # XGBTrainer + build_panel + split_panel
 │   └── scorer.py            # score_all + generate_scores
@@ -115,5 +116,5 @@ Strategy/
 - 每次特征计算完成后，必须通过随机抽查某个股票在某个特定时间点的数据，手动验证是否只用到了该时间点之前的信息。
 - AI 自动生成的策略代码，使用者务必人工核对上述“防未来数据红线”。
 
-- 添加新因子: 继承 `FactorBase`, 实现 `compute()`, 用 `@FactorRegistry.register` 装饰。
+- 添加纯日频新因子: 在 `daily_factor.py` 中继承 `FactorBase`, 实现 `compute()`, 用 `@FactorRegistry.register` 装饰。
 - 运行回测前需先生成 Label 宽表: `LabelGenerator().generate_and_save()`。
