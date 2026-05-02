@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import json
 
@@ -25,6 +25,7 @@ from tqdm.auto import tqdm
 from Strategy import config
 from Strategy.data_io.loader import MinuteDataLoader
 from Strategy.data_io.saver import save_wide_table
+from Strategy.utils.helpers import coerce_wide_values_dtype
 from Strategy.utils.helpers import get_minute_files
 
 logger = logging.getLogger(__name__)
@@ -722,7 +723,10 @@ def generate_and_save_close_preclose_label(
     return Path(label_path)
 
 
-def load_label(tag: str = "TWAP_1430_1457") -> pd.DataFrame:
+def load_label(
+    tag: str = "TWAP_1430_1457",
+    dtype: Optional[Union[str, np.dtype]] = None,
+) -> pd.DataFrame:
     """
     快捷加载已保存的 Label 宽表。
 
@@ -739,6 +743,7 @@ def load_label(tag: str = "TWAP_1430_1457") -> pd.DataFrame:
     """
     path = config.LABEL_OUTPUT_DIR / f"LABEL_{tag}.fea"
     df = pd.read_feather(path)
+    df = coerce_wide_values_dtype(df, dtype)
     df = df.set_index("TRADE_DATE")
     return df
 

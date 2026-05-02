@@ -6,7 +6,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Union
 
 import pandas as pd
 import numpy as np
@@ -88,6 +88,26 @@ def ensure_tradedate_as_index(df: pd.DataFrame) -> pd.DataFrame:
         out = out.set_index("TRADE_DATE", drop=True)
     out = normalize_tradedate_index(out)
     out.columns = standardize_stock_column(out.columns)
+    return out
+
+
+def coerce_wide_values_dtype(
+    df: pd.DataFrame,
+    dtype: Optional[Union[str, np.dtype]] = None,
+) -> pd.DataFrame:
+    """
+    将宽表数值列转换为指定 dtype, 保留 TRADE_DATE 列不变。
+
+    用于 feather 加载后的早期降精度, 例如 ``dtype="float32"`` 可在放入
+    ``factor_dict`` 前降低内存占用。
+    """
+    if dtype is None:
+        return df
+    value_cols = [col for col in df.columns if col != "TRADE_DATE"]
+    if not value_cols:
+        return df
+    out = df.copy()
+    out[value_cols] = out[value_cols].astype(dtype, copy=False)
     return out
 
 

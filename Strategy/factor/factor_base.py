@@ -15,14 +15,15 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional, Type, Union
 
 import pandas as pd
+import numpy as np
 
 from Strategy import config
 from Strategy.data_io.loader import DailyDataLoader
 from Strategy.data_io.saver import save_wide_table
-from Strategy.utils.helpers import ensure_tradedate_as_index
+from Strategy.utils.helpers import coerce_wide_values_dtype, ensure_tradedate_as_index
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,10 @@ class FactorRegistry:
         return results
 
 
-def load_factor(name: str) -> pd.DataFrame:
+def load_factor(
+    name: str,
+    dtype: Optional[Union[str, np.dtype]] = None,
+) -> pd.DataFrame:
     """快捷加载已保存的因子宽表"""
     path = config.FACTOR_OUTPUT_DIR / f"{name}.fea"
     if not path.exists():
@@ -152,12 +156,16 @@ def load_factor(name: str) -> pd.DataFrame:
                 "可降低此类损坏概率。"
             ) from e
         raise
+    df = coerce_wide_values_dtype(df, dtype)
     return ensure_tradedate_as_index(df)
 
 
-def load_all_factors(names: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
+def load_all_factors(
+    names: Optional[List[str]] = None,
+    dtype: Optional[Union[str, np.dtype]] = None,
+) -> Dict[str, pd.DataFrame]:
     """批量加载因子, 默认加载 outputs/factors/ 下所有 .fea 文件"""
     factor_dir = config.FACTOR_OUTPUT_DIR
     if names is None:
         names = [f.stem for f in factor_dir.glob("*.fea")]
-    return {name: load_factor(name) for name in names}
+    return {name: load_factor(name, dtype=dtype) for name in names}
